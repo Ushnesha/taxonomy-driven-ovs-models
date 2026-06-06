@@ -11,3 +11,5 @@ visualizations/
 scratch/
 segmentation_results.json
 ollama_server.log
+__pycache__/
+*.pyc

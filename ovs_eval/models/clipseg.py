@@ -32,27 +32,31 @@ class CLIPSegModel(BaseOVSModel):
         
         pred_masks = {}
         
+        prompts = [p_var if desc else f"a photo of a {p_var}" for p_var in text_cats.values()]
+        
+        # Batch all prompts and duplicate the image accordingly
+        inputs = self.processor(
+            text=prompts, images=[image_pil] * len(prompts), return_tensors="pt", padding=True
+        ).to(self.device)
+        
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
+            
+        logits = outputs.logits
+        if logits.dim() == 2:
+            logits = logits.unsqueeze(0)
+            
+        probs = torch.sigmoid(logits)
+        probs = F.interpolate(probs.unsqueeze(1), size=(original_height, original_width), mode='bilinear', align_corners=False)[:, 0]
+        probs_np = probs.cpu().numpy()
+        
         for idx, (p_base, p_var) in enumerate(text_cats.items()):
-            text_prompt = p_var if desc else f"a photo of a {p_var}"
-            
-            inputs = self.processor(
-                text=text_prompt, images=image_pil, return_tensors="pt", padding=True
-            ).to(self.device)
-            
-            with torch.inference_mode():
-                outputs = self.model(**inputs)
-                
             if hasattr(coco, 'getCatIds'):
                 cat_ids = coco.getCatIds(catNms=[p_base])
                 cat_id = cat_ids[0] if cat_ids else idx
             else:
                 cat_id = coco.get(p_base, idx)
                 
-            logits = outputs.logits
-            probs = torch.sigmoid(logits)[0]
-            mask = (probs > threshold).float().unsqueeze(0).unsqueeze(0)
-            mask = F.interpolate(mask, size=(original_height, original_width), mode='bilinear', align_corners=False)
-            mask = mask.squeeze(0).squeeze(0)
-            pred_masks[cat_id] = mask.cpu().numpy().astype(np.uint8)
+            pred_masks[cat_id] = (probs_np[idx] > threshold).astype(np.uint8)
             
         return pred_masks
