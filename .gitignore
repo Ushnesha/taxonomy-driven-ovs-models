@@ -1,3 +1,13 @@
 # Annotations
 annotations/
 annotations*.zip
+
+*.ipynb
+AI_CODEBASE_CONTEXT.md
+
+SAN/
+
+visualizations/
+scratch/
+segmentation_results.json
+ollama_server.log

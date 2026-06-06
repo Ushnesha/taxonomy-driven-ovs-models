@@ -1,0 +1,50 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Debug Notebook",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "showReturnValue": true
+        },
+        {
+            "name": "Python: Jupyter Notebook",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "jupyter",
+            "args": [
+                "notebook",
+                "${file}"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Debug Current Cell",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "ipykernel_launcher",
+            "args": [
+                "-f",
+                "${workspaceFolder}/.ipynb_checkpoints/kernel.json"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
