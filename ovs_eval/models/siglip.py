@@ -50,7 +50,7 @@ class SiglipModel(BaseOVSModel):
                 vision_features,
                 text_features
             ) # [C, patch_size, patch_size]
-            
+
             probs = torch.sigmoid(similarity_map) # [C, patch_size, patch_size]
             probs_interpolated = F.interpolate(
                 probs.unsqueeze(1), 
@@ -68,6 +68,15 @@ class SiglipModel(BaseOVSModel):
             else:
                 cat_id = coco.get(p_base, idx)
                 
-            pred_masks[cat_id] = (probs_np[idx] > threshold).astype(np.uint8)
+            prob_map = probs_np[idx]
+            max_val = prob_map.max()
+            min_val = prob_map.min()
+            
+            if max_val < threshold:
+                pred_masks[cat_id] = np.zeros_like(prob_map, dtype=np.uint8)
+            else:
+                dynamic_thresh = min_val + 0.5 * (max_val - min_val)
+                threshold_to_use = max(dynamic_thresh, threshold)
+                pred_masks[cat_id] = (prob_map > threshold_to_use).astype(np.uint8)
             
         return pred_masks

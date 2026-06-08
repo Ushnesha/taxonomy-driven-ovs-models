@@ -329,7 +329,10 @@ def make_sam_clip_predict(mask_generator, clip_model, clip_processor):
         toks = clip_processor(text=[f"a photo of a {n}" for n in names], images=None,
                               return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
-            txt = F.normalize(clip_model.get_text_features(**toks), dim=-1)
+            txt_feats = clip_model.get_text_features(**toks)
+            if hasattr(txt_feats, "pooler_output"):
+                txt_feats = txt_feats.pooler_output
+            txt = F.normalize(txt_feats, dim=-1)
         pred = {cid: np.zeros((H, W), np.uint8) for cid in cat_ids}
         for m in mask_generator.generate(img_np):
             seg = m["segmentation"]
@@ -339,7 +342,10 @@ def make_sam_clip_predict(mask_generator, clip_model, clip_processor):
             crop = image_pil.crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
             ci = clip_processor(images=crop, return_tensors="pt").to(device)
             with torch.no_grad():
-                im = F.normalize(clip_model.get_image_features(**ci), dim=-1)
+                im_feats = clip_model.get_image_features(**ci)
+                if hasattr(im_feats, "pooler_output"):
+                    im_feats = im_feats.pooler_output
+                im = F.normalize(im_feats, dim=-1)
             conf, idx = (im @ txt.T)[0].max(0)
             if conf.item() > threshold:
                 pred[cat_ids[idx.item()]][seg] = 1

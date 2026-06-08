@@ -64,6 +64,8 @@ class OpenSegModel(BaseOVSModel):
             
             with torch.no_grad():
                 text_features = self.model.get_text_features(text_inputs)
+                if hasattr(text_features, "pooler_output"):
+                    text_features = text_features.pooler_output
                 text_features = F.normalize(text_features, dim=-1)
                 
             image_inputs = self.processor(
@@ -72,6 +74,8 @@ class OpenSegModel(BaseOVSModel):
             
             with torch.no_grad():
                 image_features = self.model.get_image_features(image_inputs)
+                if hasattr(image_features, "pooler_output"):
+                    image_features = image_features.pooler_output
                 image_features = F.normalize(image_features, dim=-1)
                 
             similarity = (text_features @ image_features.T).cpu().numpy()[0, 0]
