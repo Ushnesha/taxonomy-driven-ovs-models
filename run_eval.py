@@ -2,10 +2,20 @@
 import argparse
 import sys
 import os
+import subprocess
+
+# Bypass sitecustomize.py model logging crash due to missing 'logger' command
+_original_popen = subprocess.Popen
+def _patched_popen(args, *popenargs, **kwargs):
+    if isinstance(args, list) and len(args) > 0 and args[0] == "logger":
+        # Redirect to a dummy python call that does nothing
+        args = [sys.executable, "-c", "pass"]
+    return _original_popen(args, *popenargs, **kwargs)
+subprocess.Popen = _patched_popen
+
 import torch
 import numpy as np
 from pycocotools.coco import COCO
-
 
 from ovs_eval.models import get_model, list_models
 from ovs_eval.evaluation import run_evaluation, compute_lss_metrics
