@@ -1,5 +1,7 @@
 import json
 import os
+import logging
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
@@ -65,40 +67,96 @@ def lss_per_class(variant_iou_dict, variants=('Original', 'Synonyms', 'Hypernyms
     
     return lss_c, mu_per_variant, mu_M_c
 
+def prepare_image_data(img_id, coco):
+    """
+    CPU and I/O bound preprocessing task.
+    """
+    image = get_img(img_id, coco)
+    annotations = get_annotations_for_image(img_id, coco)
+    
+    # Get original image shape for default masks
+    if hasattr(image, "size"):
+        w, h = image.size
+    else:
+        h, w = image.shape[:2]
+        
+    gt_masks = decode_annotations_to_masks(annotations, h, w)
+    gt_objects, _ = get_objects_from_annotations(annotations, coco)
+    cats = list(set(gt_objects))
+    
+    if not cats:
+        return None
+        
+    orig_cats, syn_cats, hyper_cats, hypo_cats = get_linguistic_cats_v2(cats)
+    
+    category_types = {
+        'Original': orig_cats,
+        'Synonyms': syn_cats,
+        'Hypernyms': hyper_cats,
+        'Hyponyms': hypo_cats
+    }
+    
+    return {
+        'img_id': img_id,
+        'image': image,
+        'gt_masks': gt_masks,
+        'category_types': category_types
+    }
+
 def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_file="segmentation_results.json"):
     """
-    Run evaluation loop over a list of image IDs.
+    Run evaluation loop over a list of image IDs using a parallelized preprocessing pipeline.
     """
+    # Configure file logging with naming convention: evaluation_<model_name>.log
+    model_name = model.__class__.__name__.lower()
+    if model_name.endswith("model"):
+        model_name = model_name[:-5]
+    log_filename = f"evaluation_{model_name}.log"
+    
+    logger = logging.getLogger("ovs_eval.evaluation")
+    logger.setLevel(logging.ERROR)
+    
+    # Avoid duplicate handlers if function called multiple times
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        
+    fh = logging.FileHandler(log_filename)
+    fh.setLevel(logging.ERROR)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
     results = defaultdict(list)
     
-    for img_id in tqdm(image_ids, desc="Processing images"):
-        try:
-            image = get_img(img_id, coco)
-            annotations = get_annotations_for_image(img_id, coco)
-            
-            # Get original image shape for default masks
-            if hasattr(image, "size"):
-                w, h = image.size
-            else:
-                h, w = image.shape[:2]
+    # Step 1: Preprocess images/masks/annotations in parallel
+    preprocessed_data = []
+    
+    # We use a ThreadPoolExecutor since this is primarily network/disk IO-bound
+    # (e.g. downloading/reading images) and releases the GIL during file operations.
+    max_workers = min(16, len(image_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(prepare_image_data, img_id, coco) for img_id in image_ids]
+        
+        # Gathering results in submitted order to preserve determinism
+        for f, img_id in tqdm(zip(futures, image_ids), total=len(image_ids), desc="Preprocessing images"):
+            try:
+                data = f.result()
+                if data is not None:
+                    preprocessed_data.append(data)
+            except Exception as e:
+                msg = f"Error preprocessing image {img_id}: {e}"
+                print(msg)
+                logger.error(msg, exc_info=True)
                 
-            gt_masks = decode_annotations_to_masks(annotations, h, w)
-            gt_objects, _ = get_objects_from_annotations(annotations, coco)
-            cats = list(set(gt_objects))
-            
-            if not cats:
-                continue
-                
-            orig_cats, syn_cats, hyper_cats, hypo_cats = get_linguistic_cats_v2(cats)
-            
-            category_types = {
-                'Original': orig_cats,
-                'Synonyms': syn_cats,
-                'Hypernyms': hyper_cats,
-                'Hyponyms': hypo_cats
-            }
-            
-            for cat_type, cat_dict in category_types.items():
+    # Step 2: Run sequential model inference on the GPU (avoids CUDA concurrency/memory issues)
+    for data in tqdm(preprocessed_data, desc="Running model inference"):
+        img_id = data['img_id']
+        image = data['image']
+        gt_masks = data['gt_masks']
+        category_types = data['category_types']
+        
+        for cat_type, cat_dict in category_types.items():
+            try:
                 pred_masks = model.predict(image, cat_dict, coco, threshold=threshold, desc=desc)
                 miou, ious = calculate_miou(gt_masks, pred_masks)
                 
@@ -108,9 +166,11 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
                     'ious': ious,
                     'categories': list(cat_dict.values())
                 })
-        except Exception as e:
-            print(f"Error processing image {img_id}: {e}")
-            continue
+            except Exception as e:
+                msg = f"Error running model inference on image {img_id}: {e}"
+                print(msg)
+                logger.error(msg, exc_info=True)
+                continue
             
     # Convert results to JSON-serializable format and save
     results_json = {}
