@@ -59,7 +59,7 @@ def main():
     print("Loading COCO validation annotations...")
     coco = COCO(ann_path)
     image_ids = coco.getImgIds()
-    print(f"Loaded {len(image_ids)} total images from COCO.")
+    print(f"Loaded {len(image_ids)} total images from COCO, using {args.num_images}.")
 
     # Instantiate model
     print(f"Initializing model '{args.model}'...")
