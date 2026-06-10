@@ -1,5 +1,6 @@
 import json
 import os
+from time import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -111,8 +112,13 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
     model_name = model.__class__.__name__.lower()
     if model_name.endswith("model"):
         model_name = model_name[:-5]
-    log_filename = f"evaluation_{model_name}.log"
+    log_filename = f"logs/evaluation_{model_name}_{int(time())}.log"
     
+    # Ensure parent log directories exist
+    log_dir = os.path.dirname(log_filename)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        
     logger = logging.getLogger("ovs_eval.evaluation")
     logger.setLevel(logging.ERROR)
     
