@@ -78,13 +78,23 @@ class GroundedSAMModel(BaseOVSModel):
         # Bounding boxes scores behave differently from pixel probabilities, so we set a sensible limit.
         box_thresh = threshold if threshold < 0.5 else 0.25
         
-        results = self.gd_processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=box_thresh,
-            text_threshold=box_thresh,
-            target_sizes=[(H, W)]
-        )[0]
+        try:
+            results = self.gd_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=box_thresh,
+                text_threshold=box_thresh,
+                target_sizes=[(H, W)]
+            )[0]
+        except TypeError:
+            # Fallback for older transformers versions where the parameter is named 'threshold'
+            results = self.gd_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=box_thresh,
+                text_threshold=box_thresh,
+                target_sizes=[(H, W)]
+            )[0]
         
         pred = {cid: np.zeros((H, W), np.uint8) for cid in cat_ids}
         

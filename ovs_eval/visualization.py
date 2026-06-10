@@ -42,10 +42,6 @@ def plot_taxonomy_evaluation(results, save_path="taxonomy_ovs_evaluation.png"):
             'count': len(mious),
         }
 
-    if 'Original' not in summary_stats or summary_stats['Original']['count'] == 0:
-        print("No evaluation data to plot.")
-        return
-
     n_images = summary_stats['Original']['count']
     if n_images == 0:
         print("No evaluation data to plot.")
