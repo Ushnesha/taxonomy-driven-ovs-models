@@ -244,3 +244,78 @@ def plot_lss_analysis(LSS_M, lss_per_class_results, save_path="lss_line_chart.pn
 
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
+
+def plot_taxonomy_deltas(LSS_M, lss_per_class_results, save_path="taxonomy_deltas.png"):
+    """
+    Renders and saves a Delta Bar Chart showing performance differences relative to Original.
+    """
+    if not lss_per_class_results:
+        print("No LSS class results to plot deltas.")
+        return
+
+    # Sort classes by LSS descending (matching the LSS plot)
+    sorted_classes = sorted(
+        lss_per_class_results.items(),
+        key=lambda x: x[1]['LSS'] if x[1]['LSS'] is not None else 0.0,
+        reverse=True
+    )
+
+    cls_names = [c[0] for c in sorted_classes]
+    n_classes = len(cls_names)
+    
+    # Extract deltas: Variant - Original
+    syn_deltas = []
+    hyper_deltas = []
+    hypo_deltas = []
+
+    for name, stats in sorted_classes:
+        mu_orig = stats['mu_per_variant'].get('Original', 0.0)
+        
+        syn_deltas.append(stats['mu_per_variant'].get('Synonyms', 0.0) - mu_orig)
+        hyper_deltas.append(stats['mu_per_variant'].get('Hypernyms', 0.0) - mu_orig)
+        hypo_deltas.append(stats['mu_per_variant'].get('Hyponyms', 0.0) - mu_orig)
+
+    fig, ax = plt.subplots(figsize=(24, 10))
+    
+    x = np.arange(n_classes)
+    width = 0.25  # width of each bar
+    
+    # Plot grouped bars
+    rects1 = ax.bar(x - width, syn_deltas, width, label='Synonyms - Original', color='#ff7f0e', alpha=0.85, edgecolor='black', linewidth=0.7)
+    rects2 = ax.bar(x, hyper_deltas, width, label='Hypernyms - Original', color='#2ca02c', alpha=0.85, edgecolor='black', linewidth=0.7)
+    rects3 = ax.bar(x + width, hypo_deltas, width, label='Hyponyms - Original', color='#d62728', alpha=0.85, edgecolor='black', linewidth=0.7)
+    
+    # Add baseline line at y = 0
+    ax.axhline(0, color='black', linewidth=1.2, linestyle='-')
+    
+    ax.set_ylabel('mIoU Difference (Variant - Original)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Class (sorted by LSS ↓)', fontsize=12, fontweight='bold')
+    ax.set_title('Taxonomy mIoU Delta Analysis — Differences relative to Original\n'
+                 'Negative values represent performance degradation', fontsize=14, fontweight='bold')
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(cls_names, rotation=55, ha='right', fontsize=9)
+    ax.grid(True, axis='y', alpha=0.3, linestyle='--')
+    ax.grid(True, axis='x', alpha=0.1, linestyle=':')
+    
+    # Alternating background bands for readability
+    for i in range(0, n_classes, 2):
+        ax.axvspan(i - 0.5, i + 0.5, color='grey', alpha=0.04)
+
+    # Set y limits with some padding
+    all_deltas = syn_deltas + hyper_deltas + hypo_deltas
+    if all_deltas:
+        min_delta = min(all_deltas)
+        max_delta = max(all_deltas)
+        ymin = min(-0.1, min_delta - 0.05)
+        ymax = max(0.1, max_delta + 0.05)
+        ax.set_ylim(ymin, ymax)
+
+    ax.legend(fontsize=10, loc='upper right', framealpha=0.9)
+    
+    fig.text(0.5, 0.99, f'Model-level LSS(M) = {LSS_M:.4f}  |  {n_classes} classes evaluated',
+             ha='center', va='top', fontsize=11, color='dimgray', style='italic')
+
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
