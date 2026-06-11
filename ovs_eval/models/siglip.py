@@ -27,30 +27,40 @@ class SiglipModel(BaseOVSModel):
         pred_masks = {}
         prompts = [p_var if desc else f"a photo of a {p_var}" for p_var in text_cats.values()]
         
-        inputs = self.processor(
-            text=prompts, images=[image_pil] * len(prompts), return_tensors="pt", padding=True
-        ).to(self.device)
+        # Preprocess text and image separately and efficiently
+        image_inputs = self.processor(images=image_pil, return_tensors="pt").to(self.device)
+        text_inputs = self.processor(text=prompts, padding="max_length", return_tensors="pt").to(self.device)
         
         with torch.inference_mode():
-            outputs = self.model(**inputs)
+            # Get vision outputs (batch_size=1)
+            vision_outputs = self.model.vision_model(**image_inputs)
+            vision_features = vision_outputs.last_hidden_state # [1, num_patches, hidden_dim]
             
-        text_features = outputs.text_model_output.last_hidden_state[:, 0, :]
-        text_features = F.normalize(text_features, dim=-1)
-
-        vision_features = outputs.vision_model_output.last_hidden_state
-        batch_size, num_patches, hidden_dim = vision_features.shape
-        patch_size = int(np.sqrt(num_patches))
-        vision_features = vision_features.reshape(batch_size, patch_size, patch_size, hidden_dim)
-        vision_features = F.normalize(vision_features, dim=-1)
-
-        # Compute similarity between each patch and text in parallel
-        with torch.inference_mode():
+            if hasattr(self.model, "visual_projection"):
+                vision_features = self.model.visual_projection(vision_features)
+                
+            b, num_patches, hidden_dim = vision_features.shape
+            patch_size = int(np.sqrt(num_patches))
+            vision_features = vision_features.reshape(patch_size, patch_size, hidden_dim)
+            vision_features = F.normalize(vision_features, dim=-1)
+            
+            # Get text features (C, hidden_dim)
+            text_features = self.model.get_text_features(**text_inputs)
+            text_features = F.normalize(text_features, dim=-1)
+            
+            # Compute similarity maps [C, patch_size, patch_size]
             similarity_map = torch.einsum(
-                'bpqd,bd->bpq',
+                'pqd,cd->cpq',
                 vision_features,
                 text_features
-            ) # [C, patch_size, patch_size]
-
+            )
+            
+            # Apply SigLIP learnable temperature scale and bias for calibrated alignment
+            logit_scale = self.model.logit_scale.exp() if hasattr(self.model, "logit_scale") else 1.0
+            logit_bias = self.model.logit_bias if hasattr(self.model, "logit_bias") else 0.0
+            similarity_map = similarity_map * logit_scale + logit_bias
+            
+            # Compute class probabilities
             probs = torch.sigmoid(similarity_map) # [C, patch_size, patch_size]
             probs_interpolated = F.interpolate(
                 probs.unsqueeze(1), 
@@ -80,3 +90,4 @@ class SiglipModel(BaseOVSModel):
                 pred_masks[cat_id] = (prob_map > threshold_to_use).astype(np.uint8)
             
         return pred_masks
+
