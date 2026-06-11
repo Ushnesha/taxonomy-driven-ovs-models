@@ -6,6 +6,7 @@ from ovs_eval.models.ovseg import OVSegModel
 from ovs_eval.models.san import SANModel
 from ovs_eval.models.sam_clip import SAMCLIPModel
 from ovs_eval.models.grounded_sam import GroundedSAMModel
+from ovs_eval.models.sam_siglip import SAMSiglipModel
 
 _REGISTRY = {
     "clipseg": CLIPSegModel,
@@ -16,6 +17,7 @@ _REGISTRY = {
     "san": SANModel,
     "sam": SAMCLIPModel,
     "grounded_sam": GroundedSAMModel,
+    "sam_siglip": SAMSiglipModel,
 }
 
 def list_models():
@@ -35,7 +37,7 @@ def get_model(name, device=None, weights=None, config=None, baseline=True):
     if device is not None:
         kwargs["device"] = device
         
-    if name in ["openseg", "sam", "grounded_sam"]:
+    if name in ["openseg", "sam", "grounded_sam", "sam_siglip"]:
         kwargs["weights"] = weights
         if name == "openseg":
             kwargs["baseline"] = baseline
