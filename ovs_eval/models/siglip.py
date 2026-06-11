@@ -46,6 +46,8 @@ class SiglipModel(BaseOVSModel):
             
             # Get text features (C, hidden_dim)
             text_features = self.model.get_text_features(**text_inputs)
+            if hasattr(text_features, "pooler_output"):
+                text_features = text_features.pooler_output
             text_features = F.normalize(text_features, dim=-1)
             
             # Compute similarity maps [C, patch_size, patch_size]
