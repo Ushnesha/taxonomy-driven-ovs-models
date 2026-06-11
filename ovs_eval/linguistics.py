@@ -110,69 +110,76 @@ def _babelnet_hyponym(word: str) -> str or None:
                         return lemma.lower().replace(" ", "_")
     return None
 
+import threading
+
+nltk_lock = threading.Lock()
+
 def get_syn(word):
-    synsets = wordnet.synsets(word)
-    if synsets:
-        return synsets[0].lemma_names()[0]
-    return word
+    with nltk_lock:
+        synsets = wordnet.synsets(word)
+        if synsets:
+            return synsets[0].lemma_names()[0]
+        return word
 
 def get_linguistic_cats(cats):
     """Simple WordNet-only lookup for synonym, hypernym, and hyponym."""
-    orig_cats, syn_cats, hyper_cats, hypo_cats = {}, {}, {}, {}
-    for cat in cats:
-        synset = wordnet.synsets(cat)[0] if wordnet.synsets(cat) else None
-        if synset:
-            synonym = next((lemma.name() for lemma in synset.lemmas() if lemma.name() != cat), cat)
-            hypernyms = synset.hypernyms()
-            hypernym = next((lemma.name() for lemma in hypernyms[0].lemmas()), cat) if hypernyms else cat
-            hyponyms = synset.hyponyms()
-            hyponym = next((lemma.name() for lemma in hyponyms[0].lemmas()), cat) if hyponyms else cat
-        else:
-            synonym = cat
-            hypernym = cat
-            hyponym = cat
-        orig_cats[cat] = cat
-        syn_cats[cat] = synonym
-        hyper_cats[cat] = hypernym
-        hypo_cats[cat] = hyponym
-    return orig_cats, syn_cats, hyper_cats, hypo_cats
+    with nltk_lock:
+        orig_cats, syn_cats, hyper_cats, hypo_cats = {}, {}, {}, {}
+        for cat in cats:
+            synset = wordnet.synsets(cat)[0] if wordnet.synsets(cat) else None
+            if synset:
+                synonym = next((lemma.name() for lemma in synset.lemmas() if lemma.name() != cat), cat)
+                hypernyms = synset.hypernyms()
+                hypernym = next((lemma.name() for lemma in hypernyms[0].lemmas()), cat) if hypernyms else cat
+                hyponyms = synset.hyponyms()
+                hyponym = next((lemma.name() for lemma in hyponyms[0].lemmas()), cat) if hyponyms else cat
+            else:
+                synonym = cat
+                hypernym = cat
+                hyponym = cat
+            orig_cats[cat] = cat
+            syn_cats[cat] = synonym
+            hyper_cats[cat] = hypernym
+            hypo_cats[cat] = hyponym
+        return orig_cats, syn_cats, hyper_cats, hypo_cats
 
 def get_linguistic_cats_v2(cats):
     """Linguistic lookup with BabelNet fallback."""
-    orig_cats, syn_cats, hyper_cats, hypo_cats = {}, {}, {}, {}
-    for cat in cats:
-        orig_cats[cat] = cat
-        synset = wordnet.synsets(cat)[0] if wordnet.synsets(cat) else None
-        
-        # Synonym lookup
-        synonym = None
-        if synset:
-            synonym = next((l.name() for l in synset.lemmas() if l.name().lower() != cat.lower()), None)
-        if synonym is None:
-            synonym = _babelnet_synonym(cat)
-        syn_cats[cat] = synonym if synonym is not None else cat
+    with nltk_lock:
+        orig_cats, syn_cats, hyper_cats, hypo_cats = {}, {}, {}, {}
+        for cat in cats:
+            orig_cats[cat] = cat
+            synset = wordnet.synsets(cat)[0] if wordnet.synsets(cat) else None
+            
+            # Synonym lookup
+            synonym = None
+            if synset:
+                synonym = next((l.name() for l in synset.lemmas() if l.name().lower() != cat.lower()), None)
+            if synonym is None:
+                synonym = _babelnet_synonym(cat)
+            syn_cats[cat] = synonym if synonym is not None else cat
 
-        # Hypernym lookup
-        hypernym = None
-        if synset:
-            hypernyms = synset.hypernyms()
-            if hypernyms:
-                hypernym = next((l.name() for l in hypernyms[0].lemmas()), None)
-        if hypernym is None:
-            hypernym = _babelnet_hypernym(cat)
-        hyper_cats[cat] = hypernym if hypernym is not None else cat
+            # Hypernym lookup
+            hypernym = None
+            if synset:
+                hypernyms = synset.hypernyms()
+                if hypernyms:
+                    hypernym = next((l.name() for l in hypernyms[0].lemmas()), None)
+            if hypernym is None:
+                hypernym = _babelnet_hypernym(cat)
+            hyper_cats[cat] = hypernym if hypernym is not None else cat
 
-        # Hyponym lookup
-        hyponym = None
-        if synset:
-            hyponyms = synset.hyponyms()
-            if hyponyms:
-                hyponym = next((l.name() for l in hyponyms[0].lemmas()), None)
-        if hyponym is None:
-            hyponym = _babelnet_hyponym(cat)
-        hypo_cats[cat] = hyponym if hyponym is not None else cat
+            # Hyponym lookup
+            hyponym = None
+            if synset:
+                hyponyms = synset.hyponyms()
+                if hyponyms:
+                    hyponym = next((l.name() for l in hyponyms[0].lemmas()), None)
+            if hyponym is None:
+                hyponym = _babelnet_hyponym(cat)
+            hypo_cats[cat] = hyponym if hyponym is not None else cat
 
-    return orig_cats, syn_cats, hyper_cats, hypo_cats
+        return orig_cats, syn_cats, hyper_cats, hypo_cats
 
 def build_valid_category_types(orig, syn, hyper, hypo) -> tuple:
     """
