@@ -57,12 +57,7 @@ class SiglipModel(BaseOVSModel):
                 text_features
             )
             
-            # Apply SigLIP learnable temperature scale and bias for calibrated alignment
-            logit_scale = self.model.logit_scale.exp() if hasattr(self.model, "logit_scale") else 1.0
-            logit_bias = self.model.logit_bias if hasattr(self.model, "logit_bias") else 0.0
-            similarity_map = similarity_map * logit_scale + logit_bias
-            
-            # Compute class probabilities
+            # Compute class probabilities (using unscaled cosine similarity matching clip_vit_large.py)
             probs = torch.sigmoid(similarity_map) # [C, patch_size, patch_size]
             probs_interpolated = F.interpolate(
                 probs.unsqueeze(1), 
