@@ -319,3 +319,72 @@ def plot_taxonomy_deltas(LSS_M, lss_per_class_results, save_path="taxonomy_delta
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
+
+def plot_taxonomy_absolute_scores(LSS_M, lss_per_class_results, save_path="taxonomy_absolute_scores.png"):
+    """
+    Renders and saves a bar chart showing absolute mIoU scores for all 4 variants
+    (Original, Synonyms, Hypernyms, Hyponyms) for each evaluated class.
+    """
+    if not lss_per_class_results:
+        print("No LSS class results to plot absolute scores.")
+        return
+
+    # Sort classes by LSS descending (matching the other plots)
+    sorted_classes = sorted(
+        lss_per_class_results.items(),
+        key=lambda x: x[1]['LSS'] if x[1]['LSS'] is not None else 0.0,
+        reverse=True
+    )
+
+    cls_names = [c[0] for c in sorted_classes]
+    n_classes = len(cls_names)
+    
+    # Extract absolute scores
+    orig_scores = []
+    syn_scores = []
+    hyper_scores = []
+    hypo_scores = []
+
+    for name, stats in sorted_classes:
+        orig_scores.append(stats['mu_per_variant'].get('Original', 0.0))
+        syn_scores.append(stats['mu_per_variant'].get('Synonyms', 0.0))
+        hyper_scores.append(stats['mu_per_variant'].get('Hypernyms', 0.0))
+        hypo_scores.append(stats['mu_per_variant'].get('Hyponyms', 0.0))
+
+    fig, ax = plt.subplots(figsize=(24, 10))
+    
+    x = np.arange(n_classes)
+    width = 0.20  # width of each bar
+    
+    # Plot 4 grouped bars
+    rects1 = ax.bar(x - 1.5 * width, orig_scores, width, label='Original', color='#1f77b4', alpha=0.85, edgecolor='black', linewidth=0.7)
+    rects2 = ax.bar(x - 0.5 * width, syn_scores, width, label='Synonyms', color='#ff7f0e', alpha=0.85, edgecolor='black', linewidth=0.7)
+    rects3 = ax.bar(x + 0.5 * width, hyper_scores, width, label='Hypernyms', color='#2ca02c', alpha=0.85, edgecolor='black', linewidth=0.7)
+    rects4 = ax.bar(x + 1.5 * width, hypo_scores, width, label='Hyponyms', color='#d62728', alpha=0.85, edgecolor='black', linewidth=0.7)
+    
+    ax.set_ylabel('Mean mIoU Score', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Class (sorted by LSS ↓)', fontsize=12, fontweight='bold')
+    ax.set_title('Taxonomy mIoU Absolute Performance Analysis\n'
+                 'Comparison of Original, Synonym, Hypernym, and Hyponym variants per class', fontsize=14, fontweight='bold')
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(cls_names, rotation=55, ha='right', fontsize=9)
+    ax.grid(True, axis='y', alpha=0.3, linestyle='--')
+    ax.grid(True, axis='x', alpha=0.1, linestyle=':')
+    
+    # Alternating background bands for readability
+    for i in range(0, n_classes, 2):
+        ax.axvspan(i - 0.5, i + 0.5, color='grey', alpha=0.04)
+
+    # Set y limits with some padding
+    ax.set_ylim(0, 1.05)
+
+    ax.legend(fontsize=10, loc='upper right', framealpha=0.9)
+    
+    fig.text(0.5, 0.99, f'Model-level LSS(M) = {LSS_M:.4f}  |  {n_classes} classes evaluated',
+             ha='center', va='top', fontsize=11, color='dimgray', style='italic')
+
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
