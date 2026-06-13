@@ -388,3 +388,103 @@ def plot_taxonomy_absolute_scores(LSS_M, lss_per_class_results, save_path="taxon
     plt.close()
 
 
+def plot_taxonomy_impact_summary(LSS_M, lss_per_class_results, save_path="taxonomy_impact_summary.png"):
+    """
+    Renders and saves a two-panel dashboard highlighting how linguistic variations
+    (Synonyms, Hypernyms, Hyponyms) affect the model's performance relative to the Original names.
+    """
+    if not lss_per_class_results:
+        print("No LSS class results to plot impact summary.")
+        return
+
+    syn_deltas = []
+    hyper_deltas = []
+    hypo_deltas = []
+    
+    orig_vals = []
+    syn_vals = []
+    hyper_vals = []
+    hypo_vals = []
+
+    for name, stats in lss_per_class_results.items():
+        v = stats['mu_per_variant']
+        orig = v.get('Original')
+        syn = v.get('Synonyms')
+        hyper = v.get('Hypernyms')
+        hypo = v.get('Hyponyms')
+        
+        if orig is not None and syn is not None and hyper is not None and hypo is not None:
+            orig_vals.append(orig)
+            syn_vals.append(syn)
+            hyper_vals.append(hyper)
+            hypo_vals.append(hypo)
+            
+            syn_deltas.append(syn - orig)
+            hyper_deltas.append(hyper - orig)
+            hypo_deltas.append(hypo - orig)
+
+    if not orig_vals:
+        print("No complete class results available for impact summary plotting.")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    
+    # ── Left panel: Violin + Box + Scatter plot of Deltas ──
+    delta_data = [syn_deltas, hyper_deltas, hypo_deltas]
+    labels = ['Synonyms', 'Hypernyms', 'Hyponyms']
+    colors = ['#ff7f0e', '#2ca02c', '#d62728']
+    
+    parts = ax1.violinplot(delta_data, showmeans=False, showmedians=False, showextrema=False)
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(colors[i])
+        pc.set_edgecolor('black')
+        pc.set_alpha(0.2)
+        
+    bp = ax1.boxplot(delta_data, patch_artist=True, widths=0.18, showfliers=False)
+    for i, box in enumerate(bp['boxes']):
+        box.set_facecolor('white')
+        box.set_edgecolor(colors[i])
+        box.set_linewidth(2.2)
+    for i, median in enumerate(bp['medians']):
+        median.set_color('black')
+        median.set_linewidth(2.2)
+    for whisker in bp['whiskers']:
+        whisker.set_color('gray')
+        whisker.set_linestyle('--')
+    for cap in bp['caps']:
+        cap.set_color('gray')
+        
+    # Draw jittered raw points
+    for i, data in enumerate(delta_data):
+        x = np.random.normal(i + 1, 0.04, size=len(data))
+        ax1.scatter(x, data, color=colors[i], alpha=0.65, edgecolor='black', linewidths=0.6, s=35, zorder=3)
+        
+    ax1.axhline(0.0, color='black', linestyle='-', linewidth=1.2)
+    ax1.set_xticks([1, 2, 3])
+    ax1.set_xticklabels(labels, fontsize=12, fontweight='bold')
+    ax1.set_ylabel('mIoU Performance Delta (Variant - Original)', fontsize=12, fontweight='bold')
+    ax1.set_title('Distribution of Performance Changes (Deltas)', fontsize=13, fontweight='bold', pad=15)
+    ax1.grid(True, axis='y', alpha=0.3, linestyle='--')
+    
+    # ── Right panel: Scatter Variant vs Original ──
+    ax2.scatter(orig_vals, syn_vals, color='#ff7f0e', alpha=0.7, edgecolor='black', linewidths=0.6, s=40, label='Synonyms', zorder=3)
+    ax2.scatter(orig_vals, hyper_vals, color='#2ca02c', alpha=0.7, edgecolor='black', linewidths=0.6, s=40, label='Hypernyms', zorder=3)
+    ax2.scatter(orig_vals, hypo_vals, color='#d62728', alpha=0.7, edgecolor='black', linewidths=0.6, s=40, label='Hyponyms', zorder=3)
+    
+    ax2.plot([0, 1], [0, 1], color='black', linestyle='--', alpha=0.6, zorder=0, label='y = x (No Change)')
+    ax2.set_xlim(-0.05, 1.05)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_xlabel('Original mIoU Score', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Variant mIoU Score', fontsize=12, fontweight='bold')
+    ax2.set_title('Variant vs. Original mIoU Correlation per Class', fontsize=13, fontweight='bold', pad=15)
+    ax2.legend(fontsize=10, loc='upper left', framealpha=0.9)
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    
+    plt.suptitle(f'Linguistic Variations Performance Impact Analysis\nModel-level LSS(M) = {LSS_M:.4f}  |  {len(orig_vals)} classes evaluated',
+                 fontsize=15, fontweight='bold', y=1.02)
+    
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+

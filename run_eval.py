@@ -19,7 +19,7 @@ from pycocotools.coco import COCO
 
 from ovs_eval.models import get_model, list_models
 from ovs_eval.evaluation import run_evaluation, compute_lss_metrics
-from ovs_eval.visualization import plot_taxonomy_evaluation, plot_lss_analysis, plot_taxonomy_deltas, plot_taxonomy_absolute_scores
+from ovs_eval.visualization import plot_taxonomy_evaluation, plot_lss_analysis, plot_taxonomy_deltas, plot_taxonomy_absolute_scores, plot_taxonomy_impact_summary
 
 def main():
     parser = argparse.ArgumentParser(description="Taxonomy-Driven OVS Models Evaluation Pipeline")
@@ -129,10 +129,12 @@ def main():
     plot_lss_path = os.path.join(model_plots_dir, "lss_line_chart.png")
     plot_deltas_path = os.path.join(model_plots_dir, "taxonomy_deltas.png")
     plot_absolute_path = os.path.join(model_plots_dir, "taxonomy_absolute_scores.png")
+    plot_summary_path = os.path.join(model_plots_dir, "taxonomy_impact_summary.png")
     plot_taxonomy_evaluation(results, save_path=plot_taxonomy_path)
     plot_lss_analysis(LSS_M, lss_results, save_path=plot_lss_path)
     plot_taxonomy_deltas(LSS_M, lss_results, save_path=plot_deltas_path)
     plot_taxonomy_absolute_scores(LSS_M, lss_results, save_path=plot_absolute_path)
+    plot_taxonomy_impact_summary(LSS_M, lss_results, save_path=plot_summary_path)
     
     print("\nEvaluation successfully completed!")
     print("Saved plots:")
@@ -140,6 +142,7 @@ def main():
     print(f"  - {plot_lss_path}")
     print(f"  - {plot_deltas_path}")
     print(f"  - {plot_absolute_path}")
+    print(f"  - {plot_summary_path}")
 
 if __name__ == "__main__":
     main()
