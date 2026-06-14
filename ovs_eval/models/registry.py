@@ -15,7 +15,7 @@ _REGISTRY = {
     "openseg": OpenSegModel,
     "ovseg": OVSegModel,
     "san": SANModel,
-    "sam": SAMCLIPModel,
+    "sam_clip": SAMCLIPModel,
     "grounded_sam": GroundedSAMModel,
     "sam_siglip": SAMSiglipModel,
 }
@@ -37,7 +37,7 @@ def get_model(name, device=None, weights=None, config=None, baseline=True):
     if device is not None:
         kwargs["device"] = device
         
-    if name in ["openseg", "sam", "grounded_sam", "sam_siglip"]:
+    if name in ["openseg", "sam_clip", "grounded_sam", "sam_siglip"]:
         kwargs["weights"] = weights
         if name == "openseg":
             kwargs["baseline"] = baseline
