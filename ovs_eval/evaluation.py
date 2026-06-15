@@ -104,9 +104,10 @@ def prepare_image_data(img_id, coco):
         'category_types': category_types
     }
 
-def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_file="segmentation_results.json"):
+def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_file="segmentation_results.json", results=None):
     """
     Run evaluation loop over a list of image IDs using a parallelized preprocessing pipeline.
+    Expects image_ids to be pre-filtered (already evaluated images skipped).
     """
     # Configure file logging with naming convention: evaluation_<model_name>.log
     model_name = model.__class__.__name__.lower()
@@ -132,8 +133,13 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-    results = defaultdict(list)
+    if results is None:
+        results = defaultdict(list)
     
+    if not image_ids:
+        print("No remaining images to evaluate. Resuming directly.")
+        return results
+
     # Step 1: Preprocess images/masks/annotations in parallel
     preprocessed_data = []
     
@@ -161,40 +167,54 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
         gt_masks = data['gt_masks']
         category_types = data['category_types']
         
+        success = True
+        temp_entries = {}
         for cat_type, cat_dict in category_types.items():
             try:
                 pred_masks = model.predict(image, cat_dict, coco, threshold=threshold, desc=desc)
                 miou, ious = calculate_miou(gt_masks, pred_masks)
                 
-                results[cat_type].append({
+                temp_entries[cat_type] = {
                     'img_id': img_id,
                     'miou': miou,
                     'ious': ious,
                     'categories': list(cat_dict.values())
-                })
+                }
             except Exception as e:
-                msg = f"Error running model inference on image {img_id}: {e}"
+                msg = f"Error running model inference on image {img_id} for variant {cat_type}: {e}"
                 print(msg)
                 logger.error(msg, exc_info=True)
-                continue
-            
-    # Convert results to JSON-serializable format and save
-    results_json = {}
-    for cat_type, results_list in results.items():
-        results_json[cat_type] = []
-        for r in results_list:
-            results_json[cat_type].append({
-                'img_id': r['img_id'],
-                'miou': float(r['miou']),
-                'categories': r['categories'],
-                'ious': {str(k): float(v) for k, v in r['ious'].items()}
-            })
-            
-    with open(output_file, 'w') as f:
-        json.dump(results_json, f, indent=2)
+                success = False
+                break
         
+        if success:
+            # Append temporary entries to the main results dictionary
+            for cat_type, entry in temp_entries.items():
+                results[cat_type].append(entry)
+            
+            # Save progress incrementally to output_file
+            try:
+                # Convert results to JSON-serializable format and save
+                results_json = {}
+                for cat_type, results_list in results.items():
+                    results_json[cat_type] = []
+                    for r in results_list:
+                        results_json[cat_type].append({
+                            'img_id': r['img_id'],
+                            'miou': float(r['miou']),
+                            'categories': r['categories'],
+                            'ious': {str(k): float(v) for k, v in r['ious'].items()}
+                        })
+                with open(output_file, 'w') as f:
+                    json.dump(results_json, f, indent=2)
+            except Exception as e:
+                msg = f"Warning: Failed to save incremental progress to '{output_file}': {e}"
+                print(msg)
+                logger.error(msg, exc_info=True)
+            
     print(f"Results saved to {output_file}")
     return results
+
 
 def compute_lss_metrics(results, variants=('Original', 'Synonyms', 'Hypernyms', 'Hyponyms')):
     """

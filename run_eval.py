@@ -75,6 +75,41 @@ def main():
         print(f"Failed to initialize model '{args.model}': {e}")
         sys.exit(1)
 
+    # Attempt to load existing results for progress resumption
+    import json
+    from collections import defaultdict
+    results = defaultdict(list)
+    completed_img_ids = set()
+
+    if os.path.exists(args.output):
+        try:
+            with open(args.output, 'r') as f:
+                existing_data = json.load(f)
+            
+            # Find image IDs that have entries under ALL available categories
+            img_ids_per_cat = {}
+            for cat_type, entries in existing_data.items():
+                img_ids_per_cat[cat_type] = {entry['img_id'] for entry in entries}
+                
+            if img_ids_per_cat:
+                cats = list(img_ids_per_cat.keys())
+                completed_for_all_cats = set.intersection(*(img_ids_per_cat[c] for c in cats))
+                
+                # Load completed entries into results
+                for cat_type, entries in existing_data.items():
+                    for entry in entries:
+                        if entry['img_id'] in completed_for_all_cats:
+                            results[cat_type].append({
+                                'img_id': entry['img_id'],
+                                'miou': entry['miou'],
+                                'categories': entry['categories'],
+                                'ious': {int(k) if k.isdigit() else k: v for k, v in entry['ious'].items()}
+                            })
+                completed_img_ids = completed_for_all_cats
+                print(f"Resuming evaluation: Loaded {len(completed_img_ids)} completed images from '{args.output}'.")
+        except Exception as e:
+            print(f"Warning: Failed to load existing results from '{args.output}': {e}. Starting from scratch.")
+
     # Determine subset of images to evaluate
     if args.smoke_test:
         # Use a single test image (e.g. 494869 as in the notebooks) or fallback to the first image ID
@@ -88,6 +123,10 @@ def main():
         subset_ids = image_ids[:args.num_images]
         print(f"Running evaluation on first {args.num_images} images.")
 
+    # Filter out already evaluated images
+    subset_ids = [img_id for img_id in subset_ids if img_id not in completed_img_ids]
+    print(f"Remaining images to evaluate: {len(subset_ids)}")
+
     # Run evaluation
     results = run_evaluation(
         model=model,
@@ -95,7 +134,8 @@ def main():
         image_ids=subset_ids,
         threshold=args.threshold,
         desc=args.desc,
-        output_file=args.output
+        output_file=args.output,
+        results=results
     )
 
     # Compute and report LSS metrics
