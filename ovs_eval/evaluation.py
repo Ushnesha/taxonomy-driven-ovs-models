@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from time import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -68,10 +69,39 @@ def lss_per_class(variant_iou_dict, variants=('Original', 'Synonyms', 'Hypernyms
     
     return lss_c, mu_per_variant, mu_M_c
 
-def prepare_image_data(img_id, coco):
+def load_preprocessed_cache(img_id, cache_dir):
+    if cache_dir is None:
+        return None
+    cache_path = os.path.join(cache_dir, f"{img_id}.pkl")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load cache for image {img_id}: {e}")
+    return None
+
+def save_preprocessed_cache(data, cache_dir):
+    if data is None or cache_dir is None:
+        return
+    img_id = data['img_id']
+    cache_path = os.path.join(cache_dir, f"{img_id}.pkl")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        print(f"Warning: Failed to save cache for image {img_id}: {e}")
+
+def prepare_image_data(img_id, coco, cache_dir=None):
     """
     CPU and I/O bound preprocessing task.
     """
+    if cache_dir is not None:
+        cached_data = load_preprocessed_cache(img_id, cache_dir)
+        if cached_data is not None:
+            return cached_data
+
     image = get_img(img_id, coco)
     annotations = get_annotations_for_image(img_id, coco)
     
@@ -97,12 +127,17 @@ def prepare_image_data(img_id, coco):
         'Hyponyms': hypo_cats
     }
     
-    return {
+    data = {
         'img_id': img_id,
         'image': image,
         'gt_masks': gt_masks,
         'category_types': category_types
     }
+    
+    if cache_dir is not None:
+        save_preprocessed_cache(data, cache_dir)
+        
+    return data
 
 def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_file="segmentation_results.json", results=None):
     """
@@ -140,6 +175,9 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
         print("No remaining images to evaluate. Resuming directly.")
         return results
 
+    # Determine model-specific preprocessed cache directory
+    cache_dir = os.path.join("results", model_name, "preprocessed")
+
     # Step 1: Preprocess images/masks/annotations in parallel
     preprocessed_data = []
     
@@ -147,7 +185,7 @@ def run_evaluation(model, coco, image_ids, threshold=0.5, desc=False, output_fil
     # (e.g. downloading/reading images) and releases the GIL during file operations.
     max_workers = min(16, len(image_ids))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(prepare_image_data, img_id, coco) for img_id in image_ids]
+        futures = [executor.submit(prepare_image_data, img_id, coco, cache_dir) for img_id in image_ids]
         
         # Gathering results in submitted order to preserve determinism
         for f, img_id in tqdm(zip(futures, image_ids), total=len(image_ids), desc="Preprocessing images"):
