@@ -33,18 +33,36 @@ def main():
                         help="Use descriptions instead of 'a photo of a <category>' prompt template.")
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run a fast execution test with a single image.")
-    parser.add_argument("--output", type=str, default="segmentation_results.json",
-                        help="JSON file path to save computed segmentation masks and results.")
+    parser.add_argument("--output", type=str, default=None,
+                        help="JSON file path to save computed segmentation masks and results. Defaults to 'results/<model_name>/segmentation_results.json'")
     parser.add_argument("--weights", type=str, default=None,
                         help="Path to external model weights (for OpenSeg TF, OVSeg, SAN).")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to model config (for OVSeg, SAN).")
     parser.add_argument("--use-actual", action="store_true",
                         help="If set, uses the actual complex wrapper from ovseg_runnable.py instead of the notebook baseline.")
-    parser.add_argument("--plots-dir", type=str, default="visualizations",
+    parser.add_argument("--plots-dir", type=str, default=None,
                         help="Directory to save the generated visualization plots.")
     
     args = parser.parse_args()
+
+    # Construct model-specific output JSON path if not explicitly provided
+    if args.output is None:
+        args.output = os.path.join("results", args.model, "segmentation_results.json")
+
+    # Ensure parent output directory exists
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Construct model-specific plots directory path if not explicitly provided
+    if args.plots_dir is None:
+        args.plots_dir = os.path.join("results", args.model, "visualizations")
+
+    # Ensure parent plots directory exists
+    plots_dir = os.path.dirname(args.plots_dir)
+    if plots_dir:
+        os.makedirs(plots_dir, exist_ok=True)
 
     # Determine device
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -163,7 +181,7 @@ def main():
 
     # Plot results
     print("\nGenerating evaluation charts...")
-    model_plots_dir = os.path.join(args.plots_dir, args.model)
+    model_plots_dir = args.plots_dir
     os.makedirs(model_plots_dir, exist_ok=True)
     plot_taxonomy_path = os.path.join(model_plots_dir, "taxonomy_ovs_evaluation.png")
     plot_lss_path = os.path.join(model_plots_dir, "lss_line_chart.png")
