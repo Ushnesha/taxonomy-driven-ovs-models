@@ -124,7 +124,7 @@ def main():
                                 'ious': {int(k) if k.isdigit() else k: v for k, v in entry['ious'].items()}
                             })
                 completed_img_ids = completed_for_all_cats
-                print(f"Resuming evaluation: Loaded {len(completed_img_ids)} completed images from '{args.output}'.")
+                print(f"Existing images found: {len(completed_img_ids)}.")
         except Exception as e:
             print(f"Warning: Failed to load existing results from '{args.output}': {e}. Starting from scratch.")
 
@@ -139,11 +139,11 @@ def main():
     else:
         # Take the specified slice of images
         subset_ids = image_ids[:args.num_images]
-        print(f"Running evaluation on first {args.num_images} images.")
+        # print(f"Running evaluation on first {args.num_images} images.")
 
     # Filter out already evaluated images
     subset_ids = [img_id for img_id in subset_ids if img_id not in completed_img_ids]
-    print(f"Remaining images to evaluate: {len(subset_ids)}")
+    print(f"Evaluating on {len(subset_ids)} images...")
 
     # Run evaluation
     results = run_evaluation(
