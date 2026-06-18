@@ -104,8 +104,13 @@ class SAMSiglipModel(BaseOVSModel):
         im_features = torch.cat(im_features_list, dim=0) # [N, D]
         
         # Parallel similarity and class selection
-        scores = im_features @ txt.T # [N, C]
-        conf, idx = scores.max(dim=1)
+        with torch.inference_mode():
+            scores = im_features @ txt.T # [N, C]
+            logit_scale = self.siglip_model.logit_scale.exp()
+            logit_bias = self.siglip_model.logit_bias
+            logits = scores * logit_scale + logit_bias
+            probs = torch.sigmoid(logits)
+            conf, idx = probs.max(dim=1)
         
         conf = conf.cpu().numpy()
         idx = idx.cpu().numpy()

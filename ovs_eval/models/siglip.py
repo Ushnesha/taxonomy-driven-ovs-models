@@ -57,8 +57,11 @@ class SiglipModel(BaseOVSModel):
                 text_features
             )
             
-            # Compute class probabilities (using unscaled cosine similarity matching clip_vit_large.py)
-            probs = torch.sigmoid(similarity_map) # [C, patch_size, patch_size]
+            # Compute class probabilities using model scale and bias parameters
+            logit_scale = self.model.logit_scale.exp()
+            logit_bias = self.model.logit_bias
+            logits = similarity_map * logit_scale + logit_bias
+            probs = torch.sigmoid(logits) # [C, patch_size, patch_size]
             probs_interpolated = F.interpolate(
                 probs.unsqueeze(1), 
                 size=(original_height, original_width), 
