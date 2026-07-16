@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image
 from collections import defaultdict
 
-from .helpers import (
+from expanded_benchmark_helpers import (
     to_wn_form, to_display_form,
     get_synset_groups_for_display,
     get_text_embedding, get_text_embedding_cached,
@@ -28,6 +28,7 @@ from .helpers import (
     load_model, get_device,
     load_coco, download_image, get_gt_mask,
     COCO_ANN, COCO_80,
+    _ensure_wordnet,
 )
 
 
@@ -66,7 +67,6 @@ def build_word_set_for_selected_synset(synset_name: str):
     Falls back to BabelNet if WordNet gives < 2 synonyms.
     """
     from nltk.corpus import wordnet as wn
-    from .helpers import _ensure_wordnet
     _ensure_wordnet()
 
     try:
@@ -126,7 +126,6 @@ def run_inference_pipeline(
     Returns dict with results for display.
     """
     from nltk.corpus import wordnet as wn
-    from .helpers import _ensure_wordnet
     _ensure_wordnet()
 
     # 1. Build word sets
@@ -279,3 +278,64 @@ def run_inference_on_coco_image(
     result["image_size"] = image.size
 
     return result
+
+
+# ── Standalone execution (example) ──
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python expanded_benchmark_inference.py <word> [synset_name]")
+        print("Example: python expanded_benchmark_inference.py bank")
+        print("         python expanded_benchmark_inference.py bank bank.n.01")
+        sys.exit(1)
+
+    word = sys.argv[1]
+
+    # Step 1: Show all synset groups
+    print(f"\nFetching synset groups for '{word}'...")
+    result = fetch_synset_groups(word)
+
+    if result["num_synsets"] == 0:
+        print("No WordNet synsets found.")
+        sys.exit(1)
+
+    print(f"\nFound {result['num_synsets']} synset group(s):")
+    for i, g in enumerate(result["synsets"]):
+        print(f"  [{i}] {g['synset_name']} — {g['definition']}")
+        print(f"      {g['lemma_count']} lemmas: {', '.join(g['lemma_names_display'])}")
+
+    # Step 2: Select synset (from CLI arg or auto-pick first)
+    if len(sys.argv) >= 3:
+        synset_name = sys.argv[2]
+    else:
+        synset_name = result["synsets"][0]["synset_name"]
+        print(f"\nNo synset specified — using first: {synset_name}")
+
+    # Step 3: Show word sets
+    ws_result = build_word_set_for_selected_synset(synset_name)
+    print(f"\nWord sets for {synset_name}:")
+    print(f"  W_S       ({ws_result['counts']['W_S']}): {ws_result['W_S_display']}")
+    print(f"  W_S_Hp    ({ws_result['counts']['W_S_Hp']}): {ws_result['W_S_Hp_display']}")
+    print(f"  W_S_Hp_He ({ws_result['counts']['W_S_Hp_He']}): {ws_result['W_S_Hp_He_display']}")
+    if ws_result.get("babelnet_supplemented"):
+        print("  (Supplemented with BabelNet)")
+
+    # Step 4: Check if a COCO image is available for this word
+    print(f"\nLooking for COCO images for '{word}'...")
+    try:
+        r = run_inference_on_coco_image(word, synset_name, alpha=0.7)
+        if "error" in r:
+            print(f"  Error: {r['error']}")
+        else:
+            print(f"  Image ID: {r['img_id']}")
+            print(f"  COCO category: {r['coco_category']}")
+            print(f"  Alpha: {r['alpha']}")
+            print(f"  Technique: {r['technique']}")
+            print(f"  Top-K neighbors: {[n['word'] for n in r['top_k_neighbors']]}")
+            if r['iou_raw_query'] is not None:
+                print(f"  IoU (raw):    {r['iou_raw_query']}")
+                print(f"  IoU (blended): {r['iou_blended']}")
+                print(f"  ΔIoU:         {r['iou_delta']}")
+    except Exception as e:
+        print(f"  Skipping COCO inference (no model/images available): {e}")
