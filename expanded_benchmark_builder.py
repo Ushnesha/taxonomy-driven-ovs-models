@@ -266,9 +266,11 @@ def process_single_coco_image(img_id, coco_dataset):
         "gt_bin_masks": gt_bin_masks
     }
 
-def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={}, num_workers=8):
-    img_ids = coco_dataset.getImgIds()[:limit]
-    
+def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    img_ids = img_ids_to_process
+    if not img_ids:
+        return img_bnch, cat_bnch
+        
     # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
     print("Building taxonomy for COCO categories...")
     for img_id in img_ids:
@@ -305,8 +307,6 @@ def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={
                 }
                 
     # 2. Process image masks in parallel using ThreadPoolExecutor
-    # ThreadPoolExecutor is ideal because C-extensions (pycocotools) and PIL release the GIL,
-    # and we avoid massive pickling overhead of the COCO annotation database.
     from concurrent.futures import ThreadPoolExecutor
     from tqdm import tqdm
     
@@ -357,10 +357,13 @@ def process_single_ade_image(idx, ade_dataset):
         "gt_bin_masks": gt_bin_masks
     }
 
-def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch={}, num_workers=8):
+def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    if not indices_to_process:
+        return img_bnch, cat_bnch
+        
     # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
     print("Building taxonomy for ADE20K categories...")
-    for idx in range(limit):
+    for idx in indices_to_process:
         data = ade_dataset[idx]
         for obj in data["objects"]:
             cat_name = obj["raw_name"]
@@ -398,38 +401,93 @@ def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch=
     from concurrent.futures import ThreadPoolExecutor
     from tqdm import tqdm
     
-    print(f"Processing {limit} ADE20K images with {num_workers} parallel workers...")
+    print(f"Processing {len(indices_to_process)} ADE20K images with {num_workers} parallel workers...")
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_single_ade_image, idx, ade_dataset) for idx in range(limit)]
+        futures = [executor.submit(process_single_ade_image, idx, ade_dataset) for idx in indices_to_process]
         for future in tqdm(futures, desc="ADE20K Images"):
             img_bnch.append(future.result())
             
     return img_bnch, cat_bnch
 
 def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
-    img_bnch, cat_bnch = [], defaultdict(list)
+    import pickle
     
-    # 1. COCO
-    print("Processing COCO...")
-    img_bnch, cat_bnch = create_benchmark_from_coco(coco_dataset, limit=limit_coco, img_bnch=img_bnch, cat_bnch=cat_bnch)
-    # 2. ADE
-    print("Processing ADE...")
-    img_bnch, cat_bnch = create_benchmark_from_ade20K(ade_dataset, limit=limit_ade, img_bnch=img_bnch, cat_bnch=cat_bnch)
+    # 1. Load existing cache if present
+    img_bnch = []
+    cat_bnch = {}
+    
+    if os.path.exists(METADATA_PATH):
+        print(f"Loading existing benchmark images from {METADATA_PATH}...")
+        try:
+            with open(METADATA_PATH, "rb") as f:
+                img_bnch = pickle.load(f)
+            print(f"  Loaded {len(img_bnch)} previously processed images.")
+        except Exception as e:
+            print(f"  Warning: Failed to load existing metadata, starting fresh: {e}")
+            img_bnch = []
+            
+    if os.path.exists(WS2_PATH):
+        print(f"Loading existing category taxonomy from {WS2_PATH}...")
+        try:
+            with open(WS2_PATH, "r") as f:
+                cat_bnch = json.load(f)
+            print(f"  Loaded {len(cat_bnch)} category taxonomy entries.")
+        except Exception as e:
+            print(f"  Warning: Failed to load taxonomy cache: {e}")
+            cat_bnch = {}
+
+    # 2. Determine what has already been processed
+    processed_coco_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "coco"}
+    processed_ade_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "ade20k"}
+
+    # 3. Filter COCO images
+    all_coco_img_ids = coco_dataset.getImgIds()
+    coco_target_ids = all_coco_img_ids[:limit_coco]
+    coco_ids_to_process = [img_id for img_id in coco_target_ids if img_id not in processed_coco_ids]
+
+    # 4. Filter ADE20K images
+    print("Checking ADE20K cache...")
+    ade_filenames = ade_dataset["filename"]
+    ade_img_ids = [int(os.path.splitext(f)[0].split('_')[-1]) for f in ade_filenames]
+    ade_target_indices = list(range(min(limit_ade, len(ade_dataset))))
+    ade_indices_to_process = [idx for idx in ade_target_indices if ade_img_ids[idx] not in processed_ade_ids]
+
+    # 5. Process COCO if needed
+    if coco_ids_to_process:
+        print(f"Processing COCO ({len(coco_ids_to_process)} new images out of target limit {limit_coco})...")
+        img_bnch, cat_bnch = create_benchmark_from_coco(
+            coco_dataset, coco_ids_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_coco} target COCO images are already processed.")
+
+    # 6. Process ADE20K if needed
+    if ade_indices_to_process:
+        print(f"Processing ADE ({len(ade_indices_to_process)} new images out of target limit {limit_ade})...")
+        img_bnch, cat_bnch = create_benchmark_from_ade20K(
+            ade_dataset, ade_indices_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_ade} target ADE20K images are already processed.")
+
+    # 7. Save updated sets to disk
     with open(METADATA_PATH, "wb") as f:
         pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"\n  Saved -> {METADATA_PATH}")
+    print(f"\n  Saved -> {METADATA_PATH} (total images: {len(img_bnch)})")
+    
     with open(WS2_PATH, "w") as f:
         json.dump(cat_bnch, f, indent=2)
-    print(f"\n  Saved -> {WS2_PATH}")
+    print(f"  Saved -> {WS2_PATH} (total categories: {len(cat_bnch)})")
     
-    # 3. Combined pos/neg sets
+    # 8. Rebuild positive/negative sets from combined metadata and save
+    print("Rebuilding positive/negative sets...")
     pos_set, neg_set = build_pos_neg_sets_from_bnchmrk(img_bnch)
     with open(POS2_PATH, "w") as f:
         json.dump(pos_set, f, indent=2)
-    print(f"\n  Saved -> {POS2_PATH}")
+    print(f"  Saved -> {POS2_PATH}")
     with open(NEG2_PATH, "w") as f:
         json.dump(neg_set, f, indent=2)
-    print(f"\n  Saved -> {NEG2_PATH}")
+    print(f"  Saved -> {NEG2_PATH}")
 
     return img_bnch, cat_bnch
 
