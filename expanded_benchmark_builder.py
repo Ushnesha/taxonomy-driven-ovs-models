@@ -318,8 +318,9 @@ def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={
             
     return img_bnch, cat_bnch
 
-def process_single_ade_image(data):
+def process_single_ade_image(idx, ade_dataset):
     """Worker function to process a single ADE20K image."""
+    data = ade_dataset[idx]
     img_pil = data["image"]
     img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
     w, h = img_pil.size
@@ -399,7 +400,7 @@ def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch=
     
     print(f"Processing {limit} ADE20K images with {num_workers} parallel workers...")
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_single_ade_image, ade_dataset[idx]) for idx in range(limit)]
+        futures = [executor.submit(process_single_ade_image, idx, ade_dataset) for idx in range(limit)]
         for future in tqdm(futures, desc="ADE20K Images"):
             img_bnch.append(future.result())
             
