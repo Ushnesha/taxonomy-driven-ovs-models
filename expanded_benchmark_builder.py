@@ -238,117 +238,151 @@ def build_word_sets(force_rebuild=False, use_babelnet=True):
 
     return word_sets, level_counts, report
 
-def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={}):
-    img_ids = coco_dataset.getImgIds()
-    print(len(img_ids))
-    for img_id in img_ids[:limit]:
-        img_meta = coco_dataset.loadImgs(img_id)[0]
-        h, w = img_meta["height"], img_meta["width"]
+def process_single_coco_image(img_id, coco_dataset):
+    """Worker function to process a single COCO image."""
+    img_meta = coco_dataset.loadImgs(img_id)[0]
+    h, w = img_meta["height"], img_meta["width"]
 
-        gt_objects = []
-        gt_bin_masks = []
+    gt_objects = []
+    gt_bin_masks = []
+    anns = get_anns_for_img_id(img_id, coco_dataset)
+    
+    for ann in anns:
+        category = coco_dataset.loadCats(ann["category_id"])[0]
+        cat_name = category["name"]
+        if cat_name not in gt_objects:
+            gt_objects.append(cat_name)
+            gt_bin_masks.append(get_gt_mask(coco_dataset, img_id, category['id']))
+            
+    return {
+        "img_src" : "coco",
+        "img_src_id": img_id,
+        "img_id" : f"coco_{img_id}",
+        "width": w,
+        "height": h,
+        "filename": img_meta["file_name"],
+        "img_url": img_meta.get("coco_url", ""),
+        "gt_objects": gt_objects,
+        "gt_bin_masks": gt_bin_masks
+    }
+
+def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={}, num_workers=8):
+    img_ids = coco_dataset.getImgIds()[:limit]
+    
+    # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
+    print("Building taxonomy for COCO categories...")
+    for img_id in img_ids:
         anns = get_anns_for_img_id(img_id, coco_dataset)
-        
         for ann in anns:
-            # start_time = time()
             category = coco_dataset.loadCats(ann["category_id"])[0]
-            # print(category)
             cat_name = category["name"]
-            if cat_name not in gt_objects:
-                gt_objects.append(cat_name)
-                gt_bin_masks.append(get_gt_mask(coco_dataset, img_id, category['id']))
-                # gt_bin_masks.append(get_bin_masks(ann["segmentation"], h, w))
             if cat_name not in cat_bnch:
-                # 1. Query local WordNet first (extremely fast)
                 definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
                     word=cat_name, supporting_words=category["supercategory"]
                 )
                 definition = definition_wn
-                synonyms = w_s_wn
-                hyponyms = w_s_hp_wn
-                hypernyms = w_s_he_wn
+                synonyms = list(w_s_wn)
+                hyponyms = list(w_s_hp_wn)
+                hypernyms = list(w_s_he_wn)
                 
-                # 2. Fallback to BabelNet ONLY if WordNet fails or has fewer than 2 synonyms
                 if not w_s_wn:
-                    print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
                     definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
                         word=cat_name, supporting_words=category["supercategory"]
                     )
-                
                     definition = definition_bn if definition_wn == "" else definition_wn
                     synonyms.extend(w_s_bn)
                     hyponyms.extend(w_s_hp_bn)
                     hypernyms.extend(w_s_he_wn)
                 
-                
-                # 3. Save to cat_bnch, limiting lists to at most 5 unique elements
                 cat_bnch[cat_name] = {
                     "cat_src_id" : category["id"],
                     "cat_src" : "coco",
                     "cat_id" : f"coco_{category['id']}",
                     "definition" : definition,
-                    "synonyms": clean_taxonomy_list(synonyms[:5]),
-                    "hyponyms": clean_taxonomy_list(hyponyms[:5]),
-                    "hypernyms": clean_taxonomy_list(hypernyms[:5])
+                    "synonyms": clean_taxonomy_list(synonyms)[:5],
+                    "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                    "hypernyms": clean_taxonomy_list(hypernyms)[:5]
                 }
-            # print(f"time taken: {(time()-start_time)*1000:.1f} ms")
-        
-        img_bnch.append({
-            "img_src" : "coco",
-            "img_src_id": img_id,
-            "img_id" : f"coco_{img_id}",
-            "width": w,
-            "height": h,
-            "filename": img_meta["file_name"],
-            "img_url": img_meta.get("coco_url", ""),
-            "gt_objects": gt_objects,
-            "gt_bin_masks": gt_bin_masks
-        })
-
+                
+    # 2. Process image masks in parallel using ThreadPoolExecutor
+    # ThreadPoolExecutor is ideal because C-extensions (pycocotools) and PIL release the GIL,
+    # and we avoid massive pickling overhead of the COCO annotation database.
+    from concurrent.futures import ThreadPoolExecutor
+    from tqdm import tqdm
+    
+    print(f"Processing {len(img_ids)} COCO images with {num_workers} parallel workers...")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_single_coco_image, img_id, coco_dataset) for img_id in img_ids]
+        for future in tqdm(futures, desc="COCO Images"):
+            img_bnch.append(future.result())
+            
     return img_bnch, cat_bnch
 
-def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch={}):
+def process_single_ade_image(data):
+    """Worker function to process a single ADE20K image."""
+    img_pil = data["image"]
+    img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
+    w, h = img_pil.size
+
+    # Group object instances and masks by category name
+    objects_by_cat = {}
+    for obj_id, obj in enumerate(data["objects"]):
+        cat_name = obj["raw_name"]
+        if cat_name not in objects_by_cat:
+            objects_by_cat[cat_name] = []
+        objects_by_cat[cat_name].append(data["instances"][obj_id])
+
+    gt_objects = []
+    gt_bin_masks = []
+    
+    for cat_name, masks in objects_by_cat.items():
+        # Combine all masks for this category using np.maximum
+        merged_mask = np.zeros((h, w), dtype=np.uint8)
+        for mask_img in masks:
+            merged_mask = np.maximum(merged_mask, (np.array(mask_img) > 0).astype(np.uint8))
+            
+        gt_objects.append(cat_name)
+        gt_bin_masks.append(merged_mask)
+        
+    return {
+        "img_src" : "ade20k",
+        "img_src_id": img_id,
+        "img_id" : f"ade20k_{img_id}",
+        "width": w,
+        "height": h,
+        "filename": data["filename"],
+        "img_url": "",
+        "gt_objects": gt_objects,
+        "gt_bin_masks": gt_bin_masks
+    }
+
+def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch={}, num_workers=8):
+    # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
+    print("Building taxonomy for ADE20K categories...")
     for idx in range(limit):
         data = ade_dataset[idx]
-        img_pil = data["image"]
-        img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
-        w, h = img_pil.size
-
-        gt_objects = []
-        gt_bin_masks = []
-        
-        for obj_id,obj in enumerate(data["objects"]):
-            # start_time = time()
-            # print(category)
+        for obj in data["objects"]:
             cat_name = obj["raw_name"]
-            if cat_name not in gt_objects:
-                gt_objects.append(cat_name)
-                gt_bin_masks.append(get_gt_mask_for_ade(data, cat_name))
             if cat_name not in cat_bnch:
-                # 1. Query local WordNet first (extremely fast)
                 hypernyms = obj["hypernym"] if len(obj["hypernym"]) > 0 else []
                 definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
                     word=cat_name, supporting_words=obj["hypernym"][:2]
                 )
                 definition = definition_wn
-                synonyms = w_s_wn
-                hyponyms = w_s_hp_wn
-                hypernyms.extend(w_s_he_wn)
+                synonyms = list(w_s_wn)
+                hyponyms = list(w_s_hp_wn)
+                hypernyms = list(w_s_he_wn)
                 
-                # 2. Fallback to BabelNet ONLY if WordNet fails or has fewer than 2 synonyms
                 if not w_s_wn:
                     print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
                     definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
                         word=cat_name, supporting_words=obj["hypernym"][:2]
                     )
-                
                     definition = definition_bn if definition_wn == "" else definition_wn
                     synonyms.extend(w_s_bn)
                     hyponyms.extend(w_s_hp_bn)
                     hypernyms.extend(w_s_he_wn)
                 
-                
-                # 3. Save to cat_bnch, limiting lists to at most 5 unique elements
                 cat_bnch[cat_name] = {
                     "cat_src_id" : obj['name_ndx'],
                     "cat_src" : "ade20k",
@@ -358,20 +392,17 @@ def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch=
                     "hyponyms": clean_taxonomy_list(hyponyms)[:5],
                     "hypernyms": clean_taxonomy_list(hypernyms)[:5]
                 }
-            # print(f"time taken: {(time()-start_time)*1000:.1f} ms")
-        
-        img_bnch.append({
-            "img_src" : "ade20k",
-            "img_src_id": img_id,
-            "img_id" : f"ade20k_{img_id}",
-            "width": w,
-            "height": h,
-            "filename": data["filename"],
-            "img_url": "",
-            "gt_objects": gt_objects,
-            "gt_bin_masks": gt_bin_masks
-        })
-
+                
+    # 2. Process image masks in parallel using ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
+    from tqdm import tqdm
+    
+    print(f"Processing {limit} ADE20K images with {num_workers} parallel workers...")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_single_ade_image, ade_dataset[idx]) for idx in range(limit)]
+        for future in tqdm(futures, desc="ADE20K Images"):
+            img_bnch.append(future.result())
+            
     return img_bnch, cat_bnch
 
 def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
