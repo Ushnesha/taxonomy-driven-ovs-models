@@ -334,10 +334,8 @@ def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], ca
             
     return img_bnch, cat_bnch
 
-def process_single_ade_image(idx, ade_dataset, ade_dataset_full=None):
-    """Worker function to process a single ADE20K image."""
-    data = ade_dataset[idx]
-    
+def process_single_ade_image_data(idx, data, ade_dataset_full=None):
+    """Worker function to process a single ADE20K image data dict."""
     # Try to get width and height from instances (which is extremely fast and avoids decoding raw image)
     instances = data.get("instances", [])
     fallback_img = None
@@ -439,17 +437,24 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
                 
     # 2. Process image masks sequentially
     from tqdm import tqdm
+    import pyarrow as pa
+    import gc
     
     print(f"Processing {len(indices_to_process)} ADE20K images...")
     checkpoint_interval = 100
-    for i, idx in enumerate(tqdm(indices_to_process, desc="ADE20K Images")):
-        result = process_single_ade_image(idx, ade_dataset_light, ade_dataset)
+    
+    # Select the subset of rows to iterate sequentially (prevents PyArrow index-caching overhead)
+    sub_dataset = ade_dataset_light.select(indices_to_process)
+    
+    for i, data in enumerate(tqdm(sub_dataset, desc="ADE20K Images")):
+        idx = indices_to_process[i]
+        result = process_single_ade_image_data(idx, data, ade_dataset)
         img_bnch.append(result)
         
         # Free memory frequently
         if (i + 1) % 10 == 0:
-            import gc
             gc.collect()
+            pa.default_memory_pool().release_unused()
             
         # Periodic crash-safe checkpointing
         if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
@@ -463,8 +468,8 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
                 json.dump(cat_bnch, f, indent=2)
             os.replace(tmp_ws_path, WS2_PATH)
             
-            import gc
             gc.collect()
+            pa.default_memory_pool().release_unused()
             
     return img_bnch, cat_bnch
 

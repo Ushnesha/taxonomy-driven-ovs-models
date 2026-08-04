@@ -14,8 +14,8 @@ import requests
 from collections import defaultdict
 from datasets import load_dataset
 # pyrefly: ignore [missing-import]
-from sentence_transformers import SentenceTransformer, util
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device='mps') 
+device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
 # ── Paths ──
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
