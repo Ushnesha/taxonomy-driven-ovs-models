@@ -374,9 +374,10 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
         
     # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
     print("Building taxonomy for ADE20K categories...")
-    for idx in indices_to_process:
-        data = ade_dataset[idx]
-        for obj in data["objects"]:
+    # Select only the 'objects' column to avoid loading and decoding heavy image/mask data
+    objects_column = ade_dataset.select(indices_to_process)["objects"]
+    for objects in objects_column:
+        for obj in objects:
             cat_name = obj["raw_name"]
             if cat_name not in cat_bnch:
                 hypernyms = obj["hypernym"] if len(obj["hypernym"]) > 0 else []
@@ -428,6 +429,10 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
             with open(tmp_ws_path, "w") as f:
                 json.dump(cat_bnch, f, indent=2)
             os.replace(tmp_ws_path, WS2_PATH)
+            
+            # Explicitly garbage collect to free up memory from Pillow PIL image objects
+            import gc
+            gc.collect()
             
     return img_bnch, cat_bnch
 
