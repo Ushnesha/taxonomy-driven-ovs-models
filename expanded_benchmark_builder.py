@@ -252,7 +252,12 @@ def process_single_coco_image(img_id, coco_dataset):
         cat_name = category["name"]
         if cat_name not in gt_objects:
             gt_objects.append(cat_name)
-            gt_bin_masks.append(get_gt_mask(coco_dataset, img_id, category['id']))
+            mask = get_gt_mask(coco_dataset, img_id, category['id'])
+            if mask is not None:
+                import zlib
+                gt_bin_masks.append(zlib.compress(mask.tobytes()))
+            else:
+                gt_bin_masks.append(b"")
             
     return {
         "img_src" : "coco",
@@ -329,12 +334,24 @@ def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], ca
             
     return img_bnch, cat_bnch
 
-def process_single_ade_image(idx, ade_dataset):
+def process_single_ade_image(idx, ade_dataset, ade_dataset_full=None):
     """Worker function to process a single ADE20K image."""
     data = ade_dataset[idx]
-    img_pil = data["image"]
+    
+    # Try to get width and height from instances (which is extremely fast and avoids decoding raw image)
+    instances = data.get("instances", [])
+    fallback_img = None
+    if instances:
+        w, h = instances[0].size
+    elif ade_dataset_full is not None:
+        full_data = ade_dataset_full[idx]
+        fallback_img = full_data["image"]
+        w, h = fallback_img.size
+    else:
+        # Fallback default
+        w, h = 256, 256
+        
     img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
-    w, h = img_pil.size
 
     # Group object instances and masks by category name
     objects_by_cat = {}
@@ -354,7 +371,15 @@ def process_single_ade_image(idx, ade_dataset):
             merged_mask = np.maximum(merged_mask, (np.array(mask_img) > 0).astype(np.uint8))
             
         gt_objects.append(cat_name)
-        gt_bin_masks.append(merged_mask)
+        # Compress the mask to save massive memory
+        import zlib
+        gt_bin_masks.append(zlib.compress(merged_mask.tobytes()))
+        
+    # Explicitly close PIL images to prevent memory leaks
+    for mask_img in instances:
+        mask_img.close()
+    if fallback_img is not None:
+        fallback_img.close()
         
     return {
         "img_src" : "ade20k",
@@ -372,10 +397,13 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
     if not indices_to_process:
         return img_bnch, cat_bnch
         
+    # Remove 'image' and 'segmentations' columns to avoid decoding/caching them during processing
+    ade_dataset_light = ade_dataset.remove_columns(["image", "segmentations"])
+
     # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
     print("Building taxonomy for ADE20K categories...")
     # Select only the 'objects' column to avoid loading and decoding heavy image/mask data
-    objects_column = ade_dataset.select(indices_to_process)["objects"]
+    objects_column = ade_dataset_light.select(indices_to_process)["objects"]
     for objects in objects_column:
         for obj in objects:
             cat_name = obj["raw_name"]
@@ -415,9 +443,14 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
     print(f"Processing {len(indices_to_process)} ADE20K images...")
     checkpoint_interval = 100
     for i, idx in enumerate(tqdm(indices_to_process, desc="ADE20K Images")):
-        result = process_single_ade_image(idx, ade_dataset)
+        result = process_single_ade_image(idx, ade_dataset_light, ade_dataset)
         img_bnch.append(result)
         
+        # Free memory frequently
+        if (i + 1) % 10 == 0:
+            import gc
+            gc.collect()
+            
         # Periodic crash-safe checkpointing
         if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
             tmp_path = METADATA_PATH + ".tmp"
@@ -430,7 +463,6 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
                 json.dump(cat_bnch, f, indent=2)
             os.replace(tmp_ws_path, WS2_PATH)
             
-            # Explicitly garbage collect to free up memory from Pillow PIL image objects
             import gc
             gc.collect()
             
