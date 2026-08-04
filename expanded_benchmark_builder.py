@@ -306,15 +306,26 @@ def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], ca
                     "hypernyms": clean_taxonomy_list(hypernyms)[:5]
                 }
                 
-    # 2. Process image masks in parallel using ThreadPoolExecutor
-    from concurrent.futures import ThreadPoolExecutor
+    # 2. Process image masks sequentially
     from tqdm import tqdm
     
-    print(f"Processing {len(img_ids)} COCO images with {num_workers} parallel workers...")
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_single_coco_image, img_id, coco_dataset) for img_id in img_ids]
-        for future in tqdm(futures, desc="COCO Images"):
-            img_bnch.append(future.result())
+    print(f"Processing {len(img_ids)} COCO images...")
+    checkpoint_interval = 100
+    for i, img_id in enumerate(tqdm(img_ids, desc="COCO Images")):
+        result = process_single_coco_image(img_id, coco_dataset)
+        img_bnch.append(result)
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(img_ids):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
             
     return img_bnch, cat_bnch
 
@@ -397,15 +408,26 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
                     "hypernyms": clean_taxonomy_list(hypernyms)[:5]
                 }
                 
-    # 2. Process image masks in parallel using ThreadPoolExecutor
-    from concurrent.futures import ThreadPoolExecutor
+    # 2. Process image masks sequentially
     from tqdm import tqdm
     
-    print(f"Processing {len(indices_to_process)} ADE20K images with {num_workers} parallel workers...")
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_single_ade_image, idx, ade_dataset) for idx in indices_to_process]
-        for future in tqdm(futures, desc="ADE20K Images"):
-            img_bnch.append(future.result())
+    print(f"Processing {len(indices_to_process)} ADE20K images...")
+    checkpoint_interval = 100
+    for i, idx in enumerate(tqdm(indices_to_process, desc="ADE20K Images")):
+        result = process_single_ade_image(idx, ade_dataset)
+        img_bnch.append(result)
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
             
     return img_bnch, cat_bnch
 
