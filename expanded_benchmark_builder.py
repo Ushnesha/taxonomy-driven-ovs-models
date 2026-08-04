@@ -635,4 +635,6 @@ if __name__ == "__main__":
     # build_all(force_rebuild=False, use_babelnet=True)
     coco_dataset = load_coco()
     ade_dataset = load_ade20k()
-    build_benchmark(coco_dataset, ade_dataset, limit_coco=10, limit_ade=10)
+    len_coco = len(coco_dataset.getImgIds())
+    len_ade = len(ade_dataset)
+    build_benchmark(coco_dataset, ade_dataset, limit_coco=len_coco, limit_ade=len_ade)
