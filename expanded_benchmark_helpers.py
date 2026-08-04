@@ -219,6 +219,11 @@ def load_coco(ann_path=COCO_ANN):
             
     return COCO(path)
 
+def get_anns_for_img_id(image_id, coco):
+    ann_ids = coco.getAnnIds(imgIds=image_id)
+    annotations = coco.loadAnns(ann_ids)
+    return annotations
+
 
 def get_cat_name_to_id(coco):
     return {cat["name"]: cat["id"] for cat in coco.loadCats(coco.getCatIds())}
@@ -289,6 +294,60 @@ def load_ade20k(local_path=ADE20K_PATH, split="validation"):
         else:
             os.environ.pop("HF_DATASETS_OFFLINE", None)
 
+def get_gt_mask_for_ade(data, cat_name):
+    """
+    Given an ADE20K data item and a category name, finds all instances 
+    matching that category and merges their masks using np.maximum.
+    """
+    import numpy as np
+    
+    # Get image dimensions (width, height)
+    w, h = data["image"].size
+    gt = np.zeros((h, w), dtype=np.uint8)
+    
+    found = False
+    for idx, obj in enumerate(data["objects"]):
+        if obj["raw_name"] == cat_name:
+            # Get the binary mask for this instance
+            instance_mask = (np.array(data["instances"][idx]) > 0).astype(np.uint8)
+            # Perform logical OR (merge)
+            gt = np.maximum(gt, instance_mask)
+            found = True
+            
+    return gt if found else None
+
+# ═══════════════════════════════════════════════
+# Data Cleaning utilities
+# ═══════════════════════════════════════════════
+def clean_taxonomy_list(raw_list):
+    _ensure_wordnet()
+    from nltk.corpus import wordnet as wn
+    """
+    Cleans a list of taxnomy words by:
+      1. Splitting comma-separated strings into individual elements.
+      2. Normalizing spaces to underscores and converting to lowercase.
+      3. Filtering out misspelled words/typos using WordNet.
+      4. Deduplicating while preserving order.
+    """
+    cleaned = []
+    for item in raw_list:
+        # Split by comma (handles "altar, communion table, Lord's table" -> ['altar', 'communion table', "Lord's table"])
+        parts = [p.strip().lower() for p in item.split(",")]
+        
+        for part in parts:
+            # Replace spaces with underscores
+            part_normalized = part.replace(" ", "_")
+            if not part_normalized:
+                continue
+                
+            # Check if it's already in the cleaned list
+            if part_normalized not in cleaned:
+                # Use WordNet to filter out typos/misspellings
+                # (e.g. "fa\u00e7ade" or "botle" will return [] and be skipped)
+                if wn.synsets(part_normalized) or wn.synsets(part.replace("_", " ")):
+                    cleaned.append(part_normalized)
+                    
+    return cleaned
 
 
 # ═══════════════════════════════════════════════
@@ -389,15 +448,37 @@ def find_best_synset_v2(word: str, supporting_words):
     from nltk.corpus import wordnet as wn
     _ensure_wordnet()
 
+    # Try exact match (underscore form and display form)
     word_wn = word.replace(" ", "_")
     word_display = word.strip().lower()
+    
     synsets = wn.synsets(word_wn, pos=wn.NOUN)
     if not synsets:
         synsets = wn.synsets(word_display, pos=wn.NOUN)
+        
+    # Try lemmatization with morphy for plural forms (e.g. "boxes" -> "box")
+    lemma = None
+    if not synsets:
+        lemma = wn.morphy(word_wn, pos=wn.NOUN)
+        if lemma:
+            synsets = wn.synsets(lemma, pos=wn.NOUN)
+        if not synsets:
+            lemma_display = wn.morphy(word_display, pos=wn.NOUN)
+            if lemma_display:
+                synsets = wn.synsets(lemma_display, pos=wn.NOUN)
+                lemma = lemma_display
+                
+    # Fallback to general synsets (any POS)
+    if not synsets:
+        synsets = wn.synsets(word_wn)
+        if not synsets and lemma:
+            synsets = wn.synsets(lemma)
+            
     if not synsets:
         return None, ""
     if len(synsets) == 1:
         return synsets[0], synsets[0].definition()
+
 
 
     # 1. Create a combined context string
@@ -502,7 +583,23 @@ def build_synset_group(synset):
 # BabelNet fallback
 # ═══════════════════════════════════════════════
 
+BN_CACHE_PATH = os.path.join(DATA_DIR, "babelnet_cache.json")
 _babelnet_cache = {}
+
+def _load_babelnet_cache():
+    global _babelnet_cache
+    if os.path.exists(BN_CACHE_PATH):
+        try:
+            with open(BN_CACHE_PATH, "r") as f:
+                _babelnet_cache = json.load(f)
+            print(f"Loaded {len(_babelnet_cache)} cached BabelNet queries from {BN_CACHE_PATH}")
+        except Exception as e:
+            print(f"Warning: Failed to load BabelNet cache: {e}")
+            _babelnet_cache = {}
+    else:
+        _babelnet_cache = {}
+
+_load_babelnet_cache()
 
 def _babelnet_get(path: str, params: dict, timeout=10):
     """Cached GET request to BabelNet API."""
@@ -519,7 +616,14 @@ def _babelnet_get(path: str, params: dict, timeout=10):
             result = r.json()
     except Exception:
         result = None
-    _babelnet_cache[cache_key] = result
+        
+    if result is not None:
+        _babelnet_cache[cache_key] = result
+        try:
+            with open(BN_CACHE_PATH, "w") as f:
+                json.dump(_babelnet_cache, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to save BabelNet cache: {e}")
     return result
 
 def _babelnet_get_synset_ids(word: str, pos="NOUN"):

@@ -14,22 +14,29 @@ WordNet-first: if WordNet gives < 2 synonyms, BabelNet supplements.
 All internal words use underscore form; display form uses spaces.
 """
 
+from PIL import TiffImagePlugin
 import json, os
 from collections import defaultdict
 import numpy as np
+import pickle
+# from expanded_benchmark_helpers import (
+#     COCO_80, DATA_DIR, COCO_ANN,
+#     load_coco, get_cat_name_to_id, download_image, get_gt_mask,
+#     to_wn_form, to_display_form,
+#     find_best_synset, build_word_sets_from_synset,
+#     supplement_word_sets_with_babelnet,
+# )
 
-from expanded_benchmark_helpers import (
-    COCO_80, DATA_DIR, COCO_ANN,
-    load_coco, get_cat_name_to_id, download_image, get_gt_mask,
-    to_wn_form, to_display_form,
-    find_best_synset, build_word_sets_from_synset,
-    supplement_word_sets_with_babelnet,
-)
+from expanded_benchmark_helpers import *
 
 # ── Output paths ──
 POS_PATH = os.path.join(DATA_DIR, "positive_set.json")
 NEG_PATH = os.path.join(DATA_DIR, "negative_set.json")
 WS_PATH  = os.path.join(DATA_DIR, "word_sets.json")
+METADATA_PATH  = os.path.join(DATA_DIR, "img_metadata.pkl")
+WS2_PATH  = os.path.join(DATA_DIR, "word_sets_v2.json")
+POS2_PATH = os.path.join(DATA_DIR, "positive_set_v2.json")
+NEG2_PATH = os.path.join(DATA_DIR, "negative_set_v2.json")
 
 
 def build_positive_negative_sets(coco=None, force_rebuild=False):
@@ -86,6 +93,38 @@ def build_positive_negative_sets(coco=None, force_rebuild=False):
     print(f"  Saved -> {NEG_PATH}")
 
     return positive_set, negative_set, all_cat_names
+
+from collections import defaultdict
+def build_pos_neg_sets_from_bnchmrk(img_bnch):
+    """
+    Builds positive and negative image sets for categories in the benchmark.
+    
+    Returns:
+      positive_set: {category: [img_ids where category exists]}
+      negative_set: {category: [img_ids where category does NOT exist]}
+    """
+    # 1. Collect all unique image IDs in this benchmark
+    all_img_ids = [img["img_id"] for img in img_bnch]
+    all_img_ids_set = set(all_img_ids)
+    
+    # 2. Build the positive set
+    positive_set = defaultdict(list)
+    for img in img_bnch:
+        img_id = img["img_id"]
+        for cat in img["gt_objects"]:
+            if img_id not in positive_set[cat]:
+                positive_set[cat].append(img_id)
+                
+    # Sort positive lists for consistency
+    positive_set = {cat: sorted(ids) for cat, ids in positive_set.items()}
+    
+    # 3. Build the negative set (All IDs minus positive IDs)
+    negative_set = {}
+    for cat, pos_ids in positive_set.items():
+        pos_set = set(pos_ids)
+        negative_set[cat] = sorted(list(all_img_ids_set - pos_set))
+        
+    return positive_set, negative_set
 
 
 def build_word_sets(force_rebuild=False, use_babelnet=True):
@@ -199,6 +238,172 @@ def build_word_sets(force_rebuild=False, use_babelnet=True):
 
     return word_sets, level_counts, report
 
+def create_benchmark_from_coco(coco_dataset, limit=5000, img_bnch=[], cat_bnch={}):
+    img_ids = coco_dataset.getImgIds()
+    print(len(img_ids))
+    for img_id in img_ids[:limit]:
+        img_meta = coco_dataset.loadImgs(img_id)[0]
+        h, w = img_meta["height"], img_meta["width"]
+
+        gt_objects = []
+        gt_bin_masks = []
+        anns = get_anns_for_img_id(img_id, coco_dataset)
+        
+        for ann in anns:
+            # start_time = time()
+            category = coco_dataset.loadCats(ann["category_id"])[0]
+            # print(category)
+            cat_name = category["name"]
+            if cat_name not in gt_objects:
+                gt_objects.append(cat_name)
+                gt_bin_masks.append(get_gt_mask(coco_dataset, img_id, category['id']))
+                # gt_bin_masks.append(get_bin_masks(ann["segmentation"], h, w))
+            if cat_name not in cat_bnch:
+                # 1. Query local WordNet first (extremely fast)
+                definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                    word=cat_name, supporting_words=category["supercategory"]
+                )
+                definition = definition_wn
+                synonyms = w_s_wn
+                hyponyms = w_s_hp_wn
+                hypernyms = w_s_he_wn
+                
+                # 2. Fallback to BabelNet ONLY if WordNet fails or has fewer than 2 synonyms
+                if not w_s_wn:
+                    print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                    definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                        word=cat_name, supporting_words=category["supercategory"]
+                    )
+                
+                    definition = definition_bn if definition_wn == "" else definition_wn
+                    synonyms.extend(w_s_bn)
+                    hyponyms.extend(w_s_hp_bn)
+                    hypernyms.extend(w_s_he_wn)
+                
+                
+                # 3. Save to cat_bnch, limiting lists to at most 5 unique elements
+                cat_bnch[cat_name] = {
+                    "cat_src_id" : category["id"],
+                    "cat_src" : "coco",
+                    "cat_id" : f"coco_{category['id']}",
+                    "definition" : definition,
+                    "synonyms": clean_taxonomy_list(synonyms[:5]),
+                    "hyponyms": clean_taxonomy_list(hyponyms[:5]),
+                    "hypernyms": clean_taxonomy_list(hypernyms[:5])
+                }
+            # print(f"time taken: {(time()-start_time)*1000:.1f} ms")
+        
+        img_bnch.append({
+            "img_src" : "coco",
+            "img_src_id": img_id,
+            "img_id" : f"coco_{img_id}",
+            "width": w,
+            "height": h,
+            "filename": img_meta["file_name"],
+            "img_url": img_meta.get("coco_url", ""),
+            "gt_objects": gt_objects,
+            "gt_bin_masks": gt_bin_masks
+        })
+
+    return img_bnch, cat_bnch
+
+def create_benchmark_from_ade20K(ade_dataset, limit=2000, img_bnch=[], cat_bnch={}):
+    for idx in range(limit):
+        data = ade_dataset[idx]
+        img_pil = data["image"]
+        img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
+        w, h = img_pil.size
+
+        gt_objects = []
+        gt_bin_masks = []
+        
+        for obj_id,obj in enumerate(data["objects"]):
+            # start_time = time()
+            # print(category)
+            cat_name = obj["raw_name"]
+            if cat_name not in gt_objects:
+                gt_objects.append(cat_name)
+                gt_bin_masks.append(get_gt_mask_for_ade(data, cat_name))
+            if cat_name not in cat_bnch:
+                # 1. Query local WordNet first (extremely fast)
+                hypernyms = obj["hypernym"] if len(obj["hypernym"]) > 0 else []
+                definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                    word=cat_name, supporting_words=obj["hypernym"][:2]
+                )
+                definition = definition_wn
+                synonyms = w_s_wn
+                hyponyms = w_s_hp_wn
+                hypernyms.extend(w_s_he_wn)
+                
+                # 2. Fallback to BabelNet ONLY if WordNet fails or has fewer than 2 synonyms
+                if not w_s_wn:
+                    print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                    definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                        word=cat_name, supporting_words=obj["hypernym"][:2]
+                    )
+                
+                    definition = definition_bn if definition_wn == "" else definition_wn
+                    synonyms.extend(w_s_bn)
+                    hyponyms.extend(w_s_hp_bn)
+                    hypernyms.extend(w_s_he_wn)
+                
+                
+                # 3. Save to cat_bnch, limiting lists to at most 5 unique elements
+                cat_bnch[cat_name] = {
+                    "cat_src_id" : obj['name_ndx'],
+                    "cat_src" : "ade20k",
+                    "cat_id" : f"ade20k_{obj['name_ndx']}",
+                    "definition" : definition,
+                    "synonyms": clean_taxonomy_list(synonyms)[:5],
+                    "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                    "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+                }
+            # print(f"time taken: {(time()-start_time)*1000:.1f} ms")
+        
+        img_bnch.append({
+            "img_src" : "ade20k",
+            "img_src_id": img_id,
+            "img_id" : f"ade20k_{img_id}",
+            "width": w,
+            "height": h,
+            "filename": data["filename"],
+            "img_url": "",
+            "gt_objects": gt_objects,
+            "gt_bin_masks": gt_bin_masks
+        })
+
+    return img_bnch, cat_bnch
+
+def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
+    img_bnch, cat_bnch = [], defaultdict(list)
+    
+    # 1. COCO
+    print("Processing COCO...")
+    img_bnch, cat_bnch = create_benchmark_from_coco(coco_dataset, limit=limit_coco, img_bnch=img_bnch, cat_bnch=cat_bnch)
+    # 2. ADE
+    print("Processing ADE...")
+    img_bnch, cat_bnch = create_benchmark_from_ade20K(ade_dataset, limit=limit_ade, img_bnch=img_bnch, cat_bnch=cat_bnch)
+    with open(METADATA_PATH, "wb") as f:
+        pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"\n  Saved -> {METADATA_PATH}")
+    with open(WS2_PATH, "w") as f:
+        json.dump(cat_bnch, f, indent=2)
+    print(f"\n  Saved -> {WS2_PATH}")
+    
+    # 3. Combined pos/neg sets
+    pos_set, neg_set = build_pos_neg_sets_from_bnchmrk(img_bnch)
+    with open(POS2_PATH, "w") as f:
+        json.dump(pos_set, f, indent=2)
+    print(f"\n  Saved -> {POS2_PATH}")
+    with open(NEG2_PATH, "w") as f:
+        json.dump(neg_set, f, indent=2)
+    print(f"\n  Saved -> {NEG2_PATH}")
+
+    return img_bnch, cat_bnch
+
+
+    
+
 
 def build_all(force_rebuild=False, use_babelnet=True):
     """
@@ -210,11 +415,13 @@ def build_all(force_rebuild=False, use_babelnet=True):
     print("=" * 60)
 
     # 1. Load COCO
-    print("\n[1/3] Loading COCO annotations...")
-    coco = load_coco(COCO_ANN)
+    print("\n[1/4] Loading COCO and ADE20K datasets...")
+    coco = load_coco()
+    ade = load_ade20k()
+
 
     # 2. Positive & negative sets
-    print("\n[2/3] Building positive/negative image sets...")
+    print("\n[2/4] Building positive/negative image sets...")
     positive_set, negative_set, all_cat_names = build_positive_negative_sets(
         coco=coco, force_rebuild=force_rebuild
     )
@@ -226,10 +433,16 @@ def build_all(force_rebuild=False, use_babelnet=True):
     print(f"  Negative: min={min(neg_counts)}, max={max(neg_counts)}, mean={np.mean(neg_counts):.0f}")
 
     # 3. Word sets
-    print("\n[3/3] Building word sets...")
+    print("\n[3/4] Building word sets...")
     word_sets, level_counts, report = build_word_sets(
         force_rebuild=force_rebuild, use_babelnet=use_babelnet
     )
+
+     # 4. Benchmark Datasets    
+    print("\n[4/4] Building benchmark datasets...")
+    
+
+    
 
     # Summary
     print("\n" + "=" * 60)
@@ -259,4 +472,7 @@ def build_all(force_rebuild=False, use_babelnet=True):
 
 # ── Standalone execution ──
 if __name__ == "__main__":
-    build_all(force_rebuild=False, use_babelnet=True)
+    # build_all(force_rebuild=False, use_babelnet=True)
+    coco_dataset = load_coco()
+    ade_dataset = load_ade20k()
+    build_benchmark(coco_dataset, ade_dataset, limit_coco=10, limit_ade=10)
