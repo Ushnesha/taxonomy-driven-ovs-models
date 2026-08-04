@@ -2,6 +2,7 @@ import requests
 from nltk.corpus import wordnet
 from functools import lru_cache
 import nltk
+import os
 
 # Ensure wordnet is downloaded
 try:
@@ -10,10 +11,10 @@ except LookupError:
     nltk.download('wordnet', quiet=True)
 
 BABELNET_URL = "https://babelnet.io/v9/"
-BABELNET_API_KEY = "3e365475-4b6a-4d8e-bb9f-f44b9b995fc3"
+BABELNET_API_KEY = os.getenv("BABELNET_API_KEY")
 
 @lru_cache(maxsize=512)
-def _babelnet_get_synset_id(word: str) -> str or None:
+def _babelnet_get_synset_id(word: str):
     """Get the best BabelNet synset ID for an English word."""
     try:
         r = requests.get(
@@ -61,7 +62,7 @@ def _babelnet_get_edges(synset_id: str) -> list:
     except Exception:
         return []
 
-def _babelnet_synonym(word: str) -> str or None:
+def _babelnet_synonym(word: str):
     """Get a synonym from BabelNet — other English lemmas in the same synset."""
     synset_id = _babelnet_get_synset_id(word)
     if not synset_id:
@@ -74,7 +75,37 @@ def _babelnet_synonym(word: str) -> str or None:
             return lemma.lower().replace(" ", "_")
     return None
 
-def _babelnet_hypernym(word: str) -> str or None:
+def babelnet_synonym_list(word: str) -> list:
+    """Get all synonyms from BabelNet for a word."""
+    synset_id = _babelnet_get_synset_id(word)
+    if not synset_id:
+        return []
+        
+    synonyms = []
+    data = _babelnet_get_synset_data(synset_id)
+    for sense in data.get("senses", []):
+        lemma = sense.get("properties", {}).get("simpleLemma", "")
+        lang  = sense.get("properties", {}).get("language", "")
+        if lang == "EN" and lemma.lower() != word.lower() and "_" not in lemma:
+            syn_name = lemma.lower().replace(" ", "_")
+            if syn_name not in synonyms:
+                synonyms.append(syn_name)
+                
+    return synonyms
+
+def babelnet_definition(word: str) -> str:
+    """Get the definition/gloss from BabelNet for a word."""
+    synset_id = _babelnet_get_synset_id(word)
+    if not synset_id:
+        return ""
+    data = _babelnet_get_synset_data(synset_id)
+    for gloss in data.get("glosses", []):
+        if gloss.get("language") == "EN":
+            return gloss.get("gloss", "")
+    return ""
+
+
+def _babelnet_hypernym(word: str):
     """Get hypernym via BabelNet edges."""
     synset_id = _babelnet_get_synset_id(word)
     if not synset_id:
@@ -92,7 +123,28 @@ def _babelnet_hypernym(word: str) -> str or None:
                         return lemma.lower().replace(" ", "_")
     return None
 
-def _babelnet_hyponym(word: str) -> str or None:
+def babelnet_hypernym_list(word: str) -> list:
+    """Get all hypernyms via BabelNet edges."""
+    synset_id = _babelnet_get_synset_id(word)
+    if not synset_id:
+        return []
+    hypernyms = []
+    edges = _babelnet_get_edges(synset_id)
+    for edge in edges:
+        if edge.get("pointer", {}).get("shortName") in ("+@", "is-a"):
+            target_id = edge.get("target")
+            if target_id:
+                target_data = _babelnet_get_synset_data(target_id)
+                for sense in target_data.get("senses", []):
+                    lemma = sense.get("properties", {}).get("simpleLemma", "")
+                    lang  = sense.get("properties", {}).get("language", "")
+                    if lang == "EN" and lemma:
+                        hyp_name = lemma.lower().replace(" ", "_")
+                        if hyp_name not in hypernyms:
+                            hypernyms.append(hyp_name)
+    return hypernyms
+
+def _babelnet_hyponym(word: str):
     """Get hyponym via BabelNet edges."""
     synset_id = _babelnet_get_synset_id(word)
     if not synset_id:
@@ -109,6 +161,28 @@ def _babelnet_hyponym(word: str) -> str or None:
                     if lang == "EN" and lemma:
                         return lemma.lower().replace(" ", "_")
     return None
+
+def babelnet_hyponym_list(word: str) -> list:
+    """Get all hyponyms via BabelNet edges."""
+    synset_id = _babelnet_get_synset_id(word)
+    if not synset_id:
+        return []
+    hyponyms = []
+    edges = _babelnet_get_edges(synset_id)
+    for edge in edges:
+        if edge.get("pointer", {}).get("shortName") in ("+~", "has-kind"):
+            target_id = edge.get("target")
+            if target_id:
+                target_data = _babelnet_get_synset_data(target_id)
+                for sense in target_data.get("senses", []):
+                    lemma = sense.get("properties", {}).get("simpleLemma", "")
+                    lang  = sense.get("properties", {}).get("language", "")
+                    if lang == "EN" and lemma:
+                        hyp_name = lemma.lower().replace(" ", "_")
+                        if hyp_name not in hyponyms:
+                            hyponyms.append(hyp_name)
+    return hyponyms
+
 
 import threading
 
