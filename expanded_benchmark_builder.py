@@ -435,41 +435,47 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
                     "hypernyms": clean_taxonomy_list(hypernyms)[:5]
                 }
                 
-    # 2. Process image masks sequentially
+    # 2. Process image masks in parallel (safe with ThreadPoolExecutor since memory is shared and GIL is released during Pillow C-decodes)
     from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor
     import pyarrow as pa
     import gc
     
-    print(f"Processing {len(indices_to_process)} ADE20K images...")
+    print(f"Processing {len(indices_to_process)} ADE20K images with {num_workers} threads...")
     checkpoint_interval = 100
     
     # Select the subset of rows to iterate sequentially (prevents PyArrow index-caching overhead)
     sub_dataset = ade_dataset_light.select(indices_to_process)
     
-    for i, data in enumerate(tqdm(sub_dataset, desc="ADE20K Images")):
+    def worker(item):
+        i, data = item
         idx = indices_to_process[i]
-        result = process_single_ade_image_data(idx, data, ade_dataset)
-        img_bnch.append(result)
+        return process_single_ade_image_data(idx, data, ade_dataset)
         
-        # Free memory frequently
-        if (i + 1) % 10 == 0:
-            gc.collect()
-            pa.default_memory_pool().release_unused()
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Use tqdm to monitor the progress of the parallel map
+        for i, result in enumerate(tqdm(executor.map(worker, enumerate(sub_dataset)), total=len(sub_dataset), desc="ADE20K Images")):
+            img_bnch.append(result)
             
-        # Periodic crash-safe checkpointing
-        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
-            tmp_path = METADATA_PATH + ".tmp"
-            with open(tmp_path, "wb") as f:
-                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, METADATA_PATH)
-            
-            tmp_ws_path = WS2_PATH + ".tmp"
-            with open(tmp_ws_path, "w") as f:
-                json.dump(cat_bnch, f, indent=2)
-            os.replace(tmp_ws_path, WS2_PATH)
-            
-            gc.collect()
-            pa.default_memory_pool().release_unused()
+            # Free memory frequently in the main thread
+            if (i + 1) % 20 == 0:
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+                
+            # Periodic crash-safe checkpointing
+            if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+                tmp_path = METADATA_PATH + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, METADATA_PATH)
+                
+                tmp_ws_path = WS2_PATH + ".tmp"
+                with open(tmp_ws_path, "w") as f:
+                    json.dump(cat_bnch, f, indent=2)
+                os.replace(tmp_ws_path, WS2_PATH)
+                
+                gc.collect()
+                pa.default_memory_pool().release_unused()
             
     return img_bnch, cat_bnch
 
