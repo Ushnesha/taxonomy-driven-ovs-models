@@ -14,6 +14,7 @@ import requests
 from collections import defaultdict
 from datasets import load_dataset
 # pyrefly: ignore [missing-import]
+from sentence_transformers import SentenceTransformer, util
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
