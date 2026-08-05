@@ -36,7 +36,6 @@ def get_model(name, device=None, weights=None, config=None, baseline=True):
     kwargs = {}
     if device is not None:
         kwargs["device"] = device
-        
     if name in ["openseg", "sam_clip", "grounded_sam", "sam_siglip"]:
         kwargs["weights"] = weights
         if name == "openseg":

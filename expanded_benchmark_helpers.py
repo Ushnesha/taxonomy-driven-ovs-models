@@ -842,8 +842,14 @@ def supplement_word_sets_with_babelnet_v2(word: str, supporting_words, limit=5):
 # ═══════════════════════════════════════════════
 
 def compute_centroid(embeddings: list):
-    """Unweighted mean of a list of (word, tensor) tuples."""
-    return torch.stack([e for _, e in embeddings]).mean(dim=0)
+    """Unweighted mean of a list of (word, tensor) or (word, tensor, similarity) tuples."""
+    tensors = []
+    for item in embeddings:
+        if isinstance(item, (tuple, list)):
+            tensors.append(item[1])
+        else:
+            tensors.append(item)
+    return torch.stack(tensors).mean(dim=0)
 
 def blend_embedding(query_emb, centroid, alpha):
     """(1-α) * query + α * centroid. Preserves raw norm."""
