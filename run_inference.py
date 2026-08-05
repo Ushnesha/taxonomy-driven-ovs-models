@@ -347,7 +347,6 @@ def main():
         import gc
         gc.collect()
         if device == "cuda":
-            import torch
             torch.cuda.empty_cache()
 
     # Save final results at the very end
