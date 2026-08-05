@@ -191,16 +191,6 @@ class CLIPSegModel(BaseOVSModel):
             
         probs = torch.sigmoid(logits)
         
-        # Resize logits back to the original image dimensions
-        # For simplicity, we assume all images in this batch have the same size (w, h)
-        # (Or you can resize them individually afterwards)
-        w, h = images[0].size
-        probs = F.interpolate(
-            probs.unsqueeze(1), 
-            size=(h, w), 
-            mode='bilinear', 
-            align_corners=False
-        )[:, 0]
         probs_np = probs.cpu().numpy()
         
         # Split the flat batch outputs back into individual image results
@@ -208,11 +198,22 @@ class CLIPSegModel(BaseOVSModel):
         for img_idx, (start, end) in enumerate(split_indices):
             img_results = {}
             prompts_for_img = image_prompts[img_idx]
+            w, h = images[img_idx].size  # Get original size of this specific image
             
             for p_idx, prompt in enumerate(prompts_for_img):
                 global_idx = start + p_idx
-                # Threshold probability to binary mask
-                binary_mask = (probs_np[global_idx] > threshold).astype(np.uint8)
+                prob_slice = probs_np[global_idx]
+                
+                # Resize specifically to this image's height and width (h, w)
+                prob_tensor = torch.tensor(prob_slice).unsqueeze(0).unsqueeze(0)  # [1, 1, H_model, W_model]
+                prob_resized = F.interpolate(
+                    prob_tensor, 
+                    size=(h, w), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze()
+                
+                binary_mask = (prob_resized.numpy() > threshold).astype(np.uint8)
                 img_results[prompt] = binary_mask
                 
             batched_results.append(img_results)
