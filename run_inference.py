@@ -338,6 +338,14 @@ def main():
             bm_hp.save_embedding_cache()
             new_images_count = 0
 
+        # Free memory from the processed chunk
+        del images_pil, gt_masks_batch, image_prompts, image_category_prompts, pred_masks_batch
+        import gc
+        gc.collect()
+        if device == "cuda":
+            import torch
+            torch.cuda.empty_cache()
+
     # Save final results at the very end
     if new_images_count > 0:
         print(f"\nSaving final results...")
