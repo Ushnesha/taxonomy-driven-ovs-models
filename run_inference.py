@@ -197,7 +197,7 @@ def main():
 
     # Run predictions in a single GPU-batched call
     print(f"\nRunning GPU-batched model predictions for {len(img_data_list)} images...")
-    pred_masks_batch = model.batch_inference_clipseg(images_pil, image_prompts, threshold=args.threshold)
+    pred_masks_batch = model.batch_inference(images_pil, image_prompts, threshold=args.threshold)
 
     # Process results and calculate IoUs
     print(f"\nCalculating IoU vs cached ground truth:")

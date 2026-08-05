@@ -1,3 +1,4 @@
+from expanded_benchmark_helpers import device
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,7 +24,6 @@ class CLIPSegModel(BaseOVSModel):
 
     def predict(self, image, text_cats, coco, threshold=0.5, desc=False):
         if isinstance(image, np.ndarray):
-            from PIL import Image
             image_pil = Image.fromarray(image)
         else:
             image_pil = image
@@ -148,7 +148,7 @@ class CLIPSegModel(BaseOVSModel):
             
         return pred_masks
 
-    def batch_inference_clipseg(self, images, image_prompts, threshold=0.5):
+    def batch_inference(self, images, image_prompts, threshold=0.5):
         """
         Runs batched inference on multiple images with different prompts.
         
@@ -156,7 +156,6 @@ class CLIPSegModel(BaseOVSModel):
             images: list of PIL Images (length B)
             image_prompts: list of lists of strings (length B), where image_prompts[i]
                         contains the prompts for images[i].
-            threshold: float, confidence threshold
             
         Returns:
             List of dicts: list of length B containing predicted masks for each prompt
@@ -170,16 +169,11 @@ class CLIPSegModel(BaseOVSModel):
         
         for img, prompts in zip(images, image_prompts):
             num_prompts = len(prompts)
-            # Replicate the image to match the number of prompts for this image
             flat_images.extend([img] * num_prompts)
             flat_prompts.extend(prompts)
             
             split_indices.append((current_idx, current_idx + num_prompts))
             current_idx += num_prompts
-            
-        if not flat_prompts:
-            return [{} for _ in images]
-
         # Run the entire batch in a single forward pass on the GPU
         inputs = self.processor(
             text=flat_prompts, 
@@ -191,11 +185,22 @@ class CLIPSegModel(BaseOVSModel):
         with torch.inference_mode():
             outputs = self.model(**inputs)
             
-        logits = outputs.logits  # Shape: [Total_Prompts, H_model, W_model]
+        logits = outputs.logits  # Shape: [Total_Prompts, H, W] (e.g. 320, 352, 352)
         if logits.dim() == 2:
             logits = logits.unsqueeze(0)
             
         probs = torch.sigmoid(logits)
+        
+        # Resize logits back to the original image dimensions
+        # For simplicity, we assume all images in this batch have the same size (w, h)
+        # (Or you can resize them individually afterwards)
+        w, h = images[0].size
+        probs = F.interpolate(
+            probs.unsqueeze(1), 
+            size=(h, w), 
+            mode='bilinear', 
+            align_corners=False
+        )[:, 0]
         probs_np = probs.cpu().numpy()
         
         # Split the flat batch outputs back into individual image results
@@ -203,22 +208,11 @@ class CLIPSegModel(BaseOVSModel):
         for img_idx, (start, end) in enumerate(split_indices):
             img_results = {}
             prompts_for_img = image_prompts[img_idx]
-            w, h = images[img_idx].size  # Get original size of this specific image
             
             for p_idx, prompt in enumerate(prompts_for_img):
                 global_idx = start + p_idx
-                prob_slice = probs_np[global_idx]
-                
-                # Resize specifically to this image's height and width
-                prob_tensor = torch.tensor(prob_slice).unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-                prob_resized = F.interpolate(
-                    prob_tensor, 
-                    size=(h, w), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).squeeze()
-                
-                binary_mask = (prob_resized.numpy() > threshold).astype(np.uint8)
+                # Threshold probability to binary mask
+                binary_mask = (probs_np[global_idx] > threshold).astype(np.uint8)
                 img_results[prompt] = binary_mask
                 
             batched_results.append(img_results)
