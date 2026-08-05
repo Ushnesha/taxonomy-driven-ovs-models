@@ -215,6 +215,13 @@ def main():
         pred_masks = pred_masks_batch[img_idx]
         cat_prompts_map = image_category_prompts[img_idx]
 
+        print(f"\nDEBUG: img_idx={img_idx}, img_id={img_id}, PIL size={image_pil.size}, metadata size={w}x{h}")
+        if pred_masks:
+            first_key = list(pred_masks.keys())[0]
+            print(f"DEBUG: pred_masks keys count={len(pred_masks)}, first key='{first_key}', mask shape={pred_masks[first_key].shape}")
+        else:
+            print("DEBUG: pred_masks is empty!")
+
         structured_results[img_id] = {}
         print(f"\nImage ID: {img_id}")
         print("-" * 105)
