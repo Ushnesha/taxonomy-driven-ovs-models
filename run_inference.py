@@ -69,6 +69,10 @@ def main():
                         help="Path to the image metadata cache file.")
     parser.add_argument("--output", type=str, default="data/inference_results.json",
                         help="Path to save the computed IoUs as a JSON file.")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path to external model weights (e.g. 'sam_vit_h_4b8939.pth' for Grounded SAM).")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to model config (for OVSeg, SAN).")
     args = parser.parse_args()
 
     # Determine device
@@ -145,7 +149,7 @@ def main():
 
     # Initialize model
     print(f"\nInitializing model '{args.model}'...")
-    model = get_model(name=args.model, device=device)
+    model = get_model(name=args.model, device=device, weights=args.weights, config=args.config)
 
     # Initialize embedding cache if blending is possible
     bm_hp.load_embedding_cache()

@@ -136,3 +136,109 @@ class GroundedSAMModel(BaseOVSModel):
                 pred[matched_cat_id] = np.logical_or(pred[matched_cat_id], masks[0]).astype(np.uint8)
                 
         return pred
+
+    def predict_v2(self, image_pil, gt_masks, text_prompts, threshold=0.3):
+        """
+        Predicts binary masks for multiple prompts on a single PIL image.
+        text_prompts can be a list of prompts or a dictionary of {key: prompt_string}.
+        """
+        if isinstance(image_pil, np.ndarray):
+            from PIL import Image
+            image_pil = Image.fromarray(image_pil)
+            img_np = image_pil
+        else:
+            img_np = np.array(image_pil.convert("RGB"))
+            
+        W, H = image_pil.size
+        
+        # Handle list vs dict
+        if isinstance(text_prompts, list):
+            prompts_dict = {p: p for p in text_prompts}
+        else:
+            prompts_dict = text_prompts
+            
+        if not prompts_dict:
+            return {}
+
+        # Normalize helper for string matching
+        def normalize_str(s):
+            return s.strip().lower().replace(".", "").replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", "")
+
+        prompt_to_key = {}
+        text_prompts_list = []
+        for key, p_text in prompts_dict.items():
+            norm_p = normalize_str(p_text)
+            prompt_to_key[norm_p] = key
+            text_prompts_list.append(p_text if p_text.endswith(".") else f"{p_text}.")
+
+        # Join prompts for Grounding DINO
+        text_prompt = " ".join(text_prompts_list)
+
+        # Run Grounding DINO
+        inputs = self.gd_processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.gd_model(**inputs)
+            
+        box_thresh = threshold if threshold < 0.5 else 0.25
+        try:
+            results = self.gd_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=box_thresh,
+                text_threshold=box_thresh,
+                target_sizes=[(H, W)]
+            )[0]
+        except TypeError:
+            results = self.gd_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=box_thresh,
+                text_threshold=box_thresh,
+                target_sizes=[(H, W)]
+            )[0]
+
+        pred_masks = {key: np.zeros((H, W), dtype=np.uint8) for key in prompts_dict.keys()}
+        
+        boxes = results.get("boxes", [])
+        scores = results.get("scores", [])
+        text_labels = results.get("text_labels", results.get("labels", []))
+        
+        if len(boxes) == 0:
+            return pred_masks
+            
+        # Set SAM image once
+        self.sam_predictor.set_image(img_np)
+        
+        for i in range(len(boxes)):
+            box = boxes[i].cpu().numpy() # [xmin, ymin, xmax, ymax]
+            label_str = text_labels[i]
+            label_norm = normalize_str(label_str)
+            
+            matched_key = None
+            if label_norm in prompt_to_key:
+                matched_key = prompt_to_key[label_norm]
+            else:
+                for p_norm, key in prompt_to_key.items():
+                    if label_norm in p_norm or p_norm in label_norm:
+                        matched_key = key
+                        break
+                        
+            if matched_key is not None:
+                masks, _, _ = self.sam_predictor.predict(
+                    box=box,
+                    multimask_output=False
+                )
+                pred_masks[matched_key] = np.logical_or(pred_masks[matched_key], masks[0]).astype(np.uint8)
+                
+        return pred_masks
+
+    def batch_inference(self, images, image_prompts, threshold=0.3):
+        """
+        Runs batch prediction sequentially over multiple images.
+        """
+        batched_results = []
+        for img, prompts in zip(images, image_prompts):
+            prompts_dict = {p: p for p in prompts}
+            pred_dict = self.predict_v2(img, None, prompts_dict, threshold=threshold)
+            batched_results.append(pred_dict)
+        return batched_results
