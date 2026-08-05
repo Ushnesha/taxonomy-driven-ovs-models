@@ -174,24 +174,34 @@ class CLIPSegModel(BaseOVSModel):
             
             split_indices.append((current_idx, current_idx + num_prompts))
             current_idx += num_prompts
-        # Run the entire batch in a single forward pass on the GPU
-        inputs = self.processor(
-            text=flat_prompts, 
-            images=flat_images, 
-            return_tensors="pt", 
-            padding=True
-        ).to(self.device)
+        # Process the flat pairs in smaller sub-batches (e.g. 64 pairs at a time) to prevent OOM
+        sub_batch_size = 64
+        all_logits = []
         
-        with torch.inference_mode():
-            outputs = self.model(**inputs)
+        for i in range(0, len(flat_prompts), sub_batch_size):
+            sub_prompts = flat_prompts[i : i + sub_batch_size]
+            sub_images = flat_images[i : i + sub_batch_size]
             
-        logits = outputs.logits  # Shape: [Total_Prompts, H, W] (e.g. 320, 352, 352)
-        if logits.dim() == 2:
-            logits = logits.unsqueeze(0)
+            inputs = self.processor(
+                text=sub_prompts, 
+                images=sub_images, 
+                return_tensors="pt", 
+                padding=True
+            ).to(self.device)
             
+            with torch.inference_mode():
+                outputs = self.model(**inputs)
+                
+            logits = outputs.logits  # Shape: [sub_batch_size, H_model, W_model]
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(0)
+            all_logits.append(logits.cpu()) # Move to CPU immediately to free VRAM/RAM
+            
+        # Concatenate all logits along batch dimension
+        logits = torch.cat(all_logits, dim=0)
+        
         probs = torch.sigmoid(logits)
-        
-        probs_np = probs.cpu().numpy()
+        probs_np = probs.numpy()
         
         # Split the flat batch outputs back into individual image results
         batched_results = []
