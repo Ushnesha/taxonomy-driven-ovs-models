@@ -162,7 +162,9 @@ class GroundedSAMModel(BaseOVSModel):
 
         # Normalize helper for string matching
         def normalize_str(s):
-            return s.strip().lower().replace(".", "").replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", "")
+            if not isinstance(s, str):
+                return ""
+            return s.strip().lower().replace(".", "").replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", "").replace("_", " ").replace("-", " ")
 
         # Grounding DINO has a 256 token limit. To safely prevent exceeding this limit,
         # we chunk the prompts into groups of at most 25.
@@ -211,12 +213,26 @@ class GroundedSAMModel(BaseOVSModel):
                 )[0]
 
             boxes = results.get("boxes", [])
-            text_labels = results.get("text_labels", results.get("labels", []))
-            
+            text_labels = results.get("text_labels")
+            if text_labels is None:
+                text_labels = results.get("labels", [])
+
+            # Diagnostic print for debugging Grounding DINO matching
+            print(f"DEBUG DINO (chunk {k_idx//chunk_size}): prompts={len(chunk_keys)} | boxes={len(boxes)} | labels={text_labels}")
+
             if len(boxes) > 0:
                 for i in range(len(boxes)):
                     box = boxes[i].cpu().numpy() # [xmin, ymin, xmax, ymax]
                     label_str = text_labels[i]
+                    # Ensure label_str is string (might be integer ID in some transformers versions)
+                    if not isinstance(label_str, str):
+                        try:
+                            # Try to decode input token index to string if possible, or fallback
+                            token_id = int(label_str)
+                            label_str = self.gd_processor.tokenizer.decode([token_id])
+                        except Exception:
+                            label_str = str(label_str)
+                            
                     label_norm = normalize_str(label_str)
                     
                     matched_key = None
