@@ -184,7 +184,7 @@ class GroundedSAMModel(BaseOVSModel):
             for key, p_text in sub_prompts_dict.items():
                 norm_p = normalize_str(p_text)
                 prompt_to_key[norm_p] = key
-                text_prompts_list.append(p_text if p_text.endswith(".") else f"{p_text}.")
+                text_prompts_list.append(norm_p if norm_p.endswith(".") else f"{norm_p}.")
 
             # Join prompts for Grounding DINO call
             text_prompt = " ".join(text_prompts_list)
