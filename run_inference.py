@@ -156,6 +156,7 @@ def main():
 
     coco_obj = None
     ade_dataset = None
+    pascal_dataset = None
     new_images_count = 0
     batch_size = args.batch_size
 
@@ -198,6 +199,11 @@ def main():
                 else:
                     print(f"Error: Could not find filename '{filename}' in the ADE20K dataset.")
                     sys.exit(1)
+            elif img_src == "pascalvoc":
+                if pascal_dataset is None:
+                    print("Loading PASCAL VOC dataset helper...")
+                    pascal_dataset = bm_hp.load_pascalvoc()
+                image_pil = pascal_dataset[img_src_id]["image"]
 
             if image_pil is None:
                 print(f"Error: Failed to load PIL Image for image ID {img_data['img_id']}")

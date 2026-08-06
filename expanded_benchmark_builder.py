@@ -39,6 +39,56 @@ POS2_PATH = os.path.join(DATA_DIR, "positive_set_v2.json")
 NEG2_PATH = os.path.join(DATA_DIR, "negative_set_v2.json")
 
 
+VOC_CLASSES = [
+    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", 
+    "bus", "car", "cat", "chair", "cow", "diningtable", "dog", 
+    "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", 
+    "train", "tvmonitor"
+]
+VOC_COLORMAP = [
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+    [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
+    [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
+    [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
+    [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
+    [0, 64, 128]
+]
+VOC_CLS_TO_IDX = {cls: idx for idx, cls in enumerate(VOC_CLASSES)}
+
+def extract_gt_objects_and_masks(dataset_item):
+    """
+    Parses a single dataset item dictionary with keys 'image' and 'mask'.
+    Returns:
+        gt_objects (list): List of class names present in the image.
+        gt_bin_masks (list): List of zlib-compressed binary masks.
+    """
+    import zlib
+    mask_img = dataset_item["mask"]
+    
+    # Convert mask PIL image to numpy array of shape (H, W, 3)
+    mask_np = np.array(mask_img.convert("RGB"))
+    
+    gt_objects = []
+    gt_bin_masks = []
+    
+    # Loop through foreground classes (1 to 20)
+    for class_id in range(1, len(VOC_CLASSES)):
+        class_name = VOC_CLASSES[class_id]
+        color = VOC_COLORMAP[class_id]
+        
+        # Check where the RGB channels match this class color
+        binary_mask = (mask_np == color).all(axis=-1)
+        
+        # If the class is present in the image, keep it
+        if binary_mask.any():
+            gt_objects.append(class_name)
+            # Store as compressed binary mask of uint8 (0 or 1)
+            compressed = zlib.compress(binary_mask.astype(np.uint8).tobytes())
+            gt_bin_masks.append(compressed)
+            
+    return gt_objects, gt_bin_masks
+
+
 def build_positive_negative_sets(coco=None, force_rebuild=False):
     """
     Build (or load cached) positive and negative image sets.
@@ -334,6 +384,82 @@ def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], ca
             
     return img_bnch, cat_bnch
 
+
+def create_benchmark_from_pascalvoc(pascal_dataset, indices_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    if not indices_to_process:
+        return img_bnch, cat_bnch
+
+    # 1. Build taxonomy sequentially first
+    print("Building taxonomy for Pascal VOC categories...")
+    for class_id in range(1, len(VOC_CLASSES)):
+        cat_name = VOC_CLASSES[class_id]
+        if cat_name not in cat_bnch:
+            definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                word=cat_name, supporting_words=[cat_name]
+            )
+            definition = definition_wn
+            synonyms = list(w_s_wn)
+            hyponyms = list(w_s_hp_wn)
+            hypernyms = list(w_s_he_wn)
+            
+            if not w_s_wn:
+                print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                    word=cat_name, supporting_words=[cat_name]
+                )
+                definition = definition_bn if definition_wn == "" else definition_wn
+                synonyms.extend(w_s_bn)
+                hyponyms.extend(w_s_hp_bn)
+                hypernyms.extend(w_s_he_wn)
+            
+            cat_bnch[cat_name] = {
+                "cat_src_id": class_id,
+                "cat_src": "pascalvoc",
+                "cat_id": f"pascalvoc_{class_id}",
+                "definition": definition,
+                "synonyms": clean_taxonomy_list(synonyms)[:5],
+                "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+            }
+
+    # 2. Process Pascal VOC images
+    from tqdm import tqdm
+    print(f"Processing {len(indices_to_process)} Pascal VOC images...")
+    checkpoint_interval = 100
+    for i, idx in enumerate(tqdm(indices_to_process, desc="Pascal VOC Images")):
+        data = pascal_dataset[idx]
+        img_pil = data["image"]
+        w, h = img_pil.size
+        
+        gt_objects, gt_bin_masks = extract_gt_objects_and_masks(data)
+        
+        img_bnch.append({
+            "img_src": "pascalvoc",
+            "img_src_id": idx,
+            "img_id": f"pascalvoc_{idx}",
+            "width": w,
+            "height": h,
+            "filename": "",
+            "img_url": "",
+            "gt_objects": gt_objects,
+            "gt_bin_masks": gt_bin_masks
+        })
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
+            
+    return img_bnch, cat_bnch
+
+
 def process_single_ade_image_data(idx, data, ade_dataset_full=None):
     """Worker function to process a single ADE20K image data dict."""
     # Try to get width and height from instances (which is extremely fast and avoids decoding raw image)
@@ -479,7 +605,7 @@ def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], c
             
     return img_bnch, cat_bnch
 
-def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
+def build_benchmark(coco_dataset, ade_dataset, pascal_dataset, limit_coco=5000, limit_ade=2000, limit_pascal=1500):
     import pickle
     
     # 1. Load existing cache if present
@@ -509,8 +635,10 @@ def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
     # 2. Determine what has already been processed
     processed_coco_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "coco"}
     processed_ade_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "ade20k"}
+    processed_pascal_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "pascalvoc"}
 
     # 3. Filter COCO images
+    print("Checking COCO cache...")
     all_coco_img_ids = coco_dataset.getImgIds()
     coco_target_ids = all_coco_img_ids[:limit_coco]
     coco_ids_to_process = [img_id for img_id in coco_target_ids if img_id not in processed_coco_ids]
@@ -522,7 +650,12 @@ def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
     ade_target_indices = list(range(min(limit_ade, len(ade_dataset))))
     ade_indices_to_process = [idx for idx in ade_target_indices if ade_img_ids[idx] not in processed_ade_ids]
 
-    # 5. Process COCO if needed
+    # 5. Filter Pascal VOC images
+    print("Checking Pascal VOC cache...")
+    pascal_target_indices = list(range(min(limit_pascal, len(pascal_dataset))))
+    pascal_indices_to_process = [idx for idx in pascal_target_indices if idx not in processed_pascal_ids]
+
+    # 6. Process COCO if needed
     if coco_ids_to_process:
         print(f"Processing COCO ({len(coco_ids_to_process)} new images out of target limit {limit_coco})...")
         img_bnch, cat_bnch = create_benchmark_from_coco(
@@ -531,7 +664,7 @@ def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
     else:
         print(f"All {limit_coco} target COCO images are already processed.")
 
-    # 6. Process ADE20K if needed
+    # 7. Process ADE20K if needed
     if ade_indices_to_process:
         print(f"Processing ADE ({len(ade_indices_to_process)} new images out of target limit {limit_ade})...")
         img_bnch, cat_bnch = create_benchmark_from_ade20K(
@@ -540,7 +673,16 @@ def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
     else:
         print(f"All {limit_ade} target ADE20K images are already processed.")
 
-    # 7. Save updated sets to disk
+    # 8. Process Pascal VOC if needed
+    if pascal_indices_to_process:
+        print(f"Processing Pascal VOC ({len(pascal_indices_to_process)} new images out of target limit {limit_pascal})...")
+        img_bnch, cat_bnch = create_benchmark_from_pascalvoc(
+            pascal_dataset, pascal_indices_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_pascal} target Pascal VOC images are already processed.")
+
+    # 9. Save updated sets to disk
     with open(METADATA_PATH, "wb") as f:
         pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"\n  Saved -> {METADATA_PATH} (total images: {len(img_bnch)})")
@@ -549,7 +691,7 @@ def build_benchmark(coco_dataset, ade_dataset, limit_coco=5000, limit_ade=2000):
         json.dump(cat_bnch, f, indent=2)
     print(f"  Saved -> {WS2_PATH} (total categories: {len(cat_bnch)})")
     
-    # 8. Rebuild positive/negative sets from combined metadata and save
+    # 10. Rebuild positive/negative sets from combined metadata and save
     print("Rebuilding positive/negative sets...")
     pos_set, neg_set = build_pos_neg_sets_from_bnchmrk(img_bnch)
     with open(POS2_PATH, "w") as f:
@@ -597,13 +739,7 @@ def build_all(force_rebuild=False, use_babelnet=True):
     word_sets, level_counts, report = build_word_sets(
         force_rebuild=force_rebuild, use_babelnet=use_babelnet
     )
-
-     # 4. Benchmark Datasets    
-    print("\n[4/4] Building benchmark datasets...")
     
-
-    
-
     # Summary
     print("\n" + "=" * 60)
     print("BUILD COMPLETE")
@@ -635,6 +771,11 @@ if __name__ == "__main__":
     # build_all(force_rebuild=False, use_babelnet=True)
     coco_dataset = load_coco()
     ade_dataset = load_ade20k()
+    pascal_dataset = load_pascalvoc()
     len_coco = len(coco_dataset.getImgIds())
     len_ade = len(ade_dataset)
-    build_benchmark(coco_dataset, ade_dataset, limit_coco=len_coco, limit_ade=len_ade)
+    len_pascal = len(pascal_dataset)
+    build_benchmark(
+        coco_dataset, ade_dataset, pascal_dataset,
+        limit_coco=len_coco, limit_ade=len_ade, limit_pascal=len_pascal
+    )

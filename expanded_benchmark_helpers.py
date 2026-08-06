@@ -22,6 +22,7 @@ embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 COCO_ANN  = os.path.join(REPO_ROOT, "datasets", "coco", "instances_val2017.json")
 ADE20K_PATH = os.path.join(REPO_ROOT, "datasets", "ade20k")
+PASCALVOC_PATH = os.path.join(REPO_ROOT, "datasets", "pascalvoc")
 DATA_DIR  = os.path.join(REPO_ROOT, "data")
 COCO_URL  = "http://images.cocodataset.org/val2017/{:012d}.jpg"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -316,6 +317,44 @@ def get_gt_mask_for_ade(data, cat_name):
             found = True
             
     return gt if found else None
+
+# ═══════════════════════════════════════════════
+# Pascal VOC utilities
+# ═══════════════════════════════════════════════
+def load_pascalvoc(local_path=PASCALVOC_PATH, split="val"):
+    """Loads the PASCAL VOC dataset from local cache if available, otherwise downloads it."""
+    import os
+    from datasets import load_dataset
+    
+    # Save the original environment state
+    orig_offline = os.environ.get("HF_DATASETS_OFFLINE")
+    
+    try:
+        # Enforce offline mode to avoid remote hub latency
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        dataset = load_dataset("nateraw/pascal-voc-2012", split=split, cache_dir=local_path)
+        print(f"Loaded PASCAL VOC {split} dataset from local cache.")
+        return dataset
+    except Exception:
+        print("PASCAL VOC dataset not found in local cache. Downloading from Hugging Face...")
+        # Disable offline mode to allow downloading
+        os.environ["HF_DATASETS_OFFLINE"] = "0"
+        try:
+            dataset = load_dataset("nateraw/pascal-voc-2012", split=split, cache_dir=local_path)
+            print("Download and load complete.")
+            return dataset
+        finally:
+            # Restore the original environment state
+            if orig_offline is not None:
+                os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+            else:
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
+    finally:
+        # Restore the original environment state if loading succeeded
+        if orig_offline is not None:
+            os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+        else:
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
 
 # ═══════════════════════════════════════════════
 # Data Cleaning utilities
