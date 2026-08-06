@@ -649,10 +649,24 @@ def build_word_sets_from_synset_v2(word: str, supporting_words=None, limit=5, sy
     w_s_hp = []
     w_s_he = []
     w_s = []
+    definition = ""
     if supporting_words is None:
         supporting_words = [word]
     if synset is None:
         synset, definition = find_best_synset_v2(word, supporting_words)
+    elif isinstance(synset, str):
+        from nltk.corpus import wordnet as wn
+        _ensure_wordnet()
+        try:
+            synset = wn.synset(synset)
+            definition = synset.definition()
+        except Exception:
+            synset = None
+    else:
+        try:
+            definition = synset.definition()
+        except Exception:
+            definition = ""
     
     if synset:
         w_s = list(synset.lemma_names())[:5]
