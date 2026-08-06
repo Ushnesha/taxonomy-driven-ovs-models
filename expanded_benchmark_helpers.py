@@ -25,6 +25,8 @@ ADE20K_PATH = os.path.join(REPO_ROOT, "datasets", "ade20k")
 PASCALVOC_PATH = os.path.join(REPO_ROOT, "datasets", "pascalvoc")
 DATA_DIR  = os.path.join(REPO_ROOT, "data")
 COCO_URL  = "http://images.cocodataset.org/val2017/{:012d}.jpg"
+LVIS_PATH = os.path.join(REPO_ROOT, "datasets", "lvis")
+LVIS_ANN = os.path.join(LVIS_PATH, "lvis_v1_val.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── BabelNet config ──
@@ -357,6 +359,70 @@ def load_pascalvoc(local_path=PASCALVOC_PATH, split="val"):
             os.environ.pop("HF_DATASETS_OFFLINE", None)
 
 # ═══════════════════════════════════════════════
+# LVIS utilities
+# ═══════════════════════════════════════════════
+def load_lvis(local_path=LVIS_PATH, zip_url="https://dl.fbaipublicfiles.com/LVIS/lvis_v1_val.json.zip"):
+    """Downloads, extracts, and loads LVIS v1.0 validation annotations JSON."""
+    import zipfile
+    import requests
+    
+    os.makedirs(local_path, exist_ok=True)
+    json_path = os.path.join(local_path, "lvis_v1_val.json")
+    zip_path = os.path.join(local_path, "lvis_v1_val.json.zip")
+    
+    if not os.path.exists(json_path):
+        if not os.path.exists(zip_path):
+            print(f"LVIS annotations not found at {json_path}. Downloading from {zip_url}...")
+            try:
+                r = requests.get(zip_url, stream=True)
+                r.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("Download complete.")
+            except Exception as e:
+                print(f"Error downloading LVIS annotations: {e}")
+                raise e
+        
+        print(f"Extracting LVIS annotations from {zip_path}...")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(local_path)
+            print("Extraction complete.")
+        except Exception as e:
+            print(f"Error extracting LVIS zip: {e}")
+            raise e
+            
+    print(f"Loading LVIS annotations from {json_path}...")
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    return data
+
+def decode_lvis_ann_to_mask(ann, h, w):
+    """
+    Decode LVIS polygon/RLE segmentation into a binary mask.
+    Returns:
+        np.ndarray: [H, W] binary mask of type uint8 (0 or 1)
+    """
+    from pycocotools import mask as maskUtils
+    segm = ann['segmentation']
+    if isinstance(segm, list):
+        # polygon
+        rles = maskUtils.frPyObjects(segm, h, w)
+        rle = maskUtils.merge(rles)
+    elif isinstance(segm, dict):
+        if isinstance(segm['counts'], list):
+            # uncompressed RLE
+            rle = maskUtils.frPyObjects(segm, h, w)
+        else:
+            # RLE
+            rle = segm
+    else:
+        return None
+    return maskUtils.decode(rle)
+
+
+# ═══════════════════════════════════════════════
 # Data Cleaning utilities
 # ═══════════════════════════════════════════════
 def clean_taxonomy_list(raw_list):
@@ -579,11 +645,15 @@ def build_word_sets_from_synset(synset):
         "W_S_Hp_He": w_s_hp_he,
     }
 
-def build_word_sets_from_synset_v2(word: str, supporting_words, limit=5):
+def build_word_sets_from_synset_v2(word: str, supporting_words=None, limit=5, synset=None):
     w_s_hp = []
     w_s_he = []
     w_s = []
-    synset, definition = find_best_synset_v2(word, supporting_words)
+    if supporting_words is None:
+        supporting_words = [word]
+    if synset is None:
+        synset, definition = find_best_synset_v2(word, supporting_words)
+    
     if synset:
         w_s = list(synset.lemma_names())[:5]
         i = 0

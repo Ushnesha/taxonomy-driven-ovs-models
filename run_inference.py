@@ -204,6 +204,15 @@ def main():
                     print("Loading PASCAL VOC dataset helper...")
                     pascal_dataset = bm_hp.load_pascalvoc()
                 image_pil = pascal_dataset[img_src_id]["image"]
+            elif img_src == "lvis":
+                if coco_obj is None:
+                    print("Loading COCO annotations helper (for LVIS)...")
+                    from pycocotools.coco import COCO
+                    if not os.path.exists(bm_hp.COCO_ANN):
+                        print(f"Error: COCO annotations not found at {bm_hp.COCO_ANN}")
+                        sys.exit(1)
+                    coco_obj = COCO(bm_hp.COCO_ANN)
+                image_pil = get_img(img_src_id, coco_obj)
 
             if image_pil is None:
                 print(f"Error: Failed to load PIL Image for image ID {img_data['img_id']}")
