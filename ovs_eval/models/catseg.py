@@ -11,21 +11,26 @@ class CATSegModel(BaseOVSModel):
     """
     CAT-Seg (Cost Aggregation Transformer for Open-Vocabulary Segmentation) wrapper for ovs_eval.
     """
-    def __init__(self, device=None, config=None, weights=None, baseline=True, catseg_path="CAT-Seg"):
+    def __init__(self, device=None, config=None, weights=None, baseline=None, catseg_path="CAT-Seg"):
         """
-        If baseline=True, uses CLIPSeg as fallback/baseline.
-        If baseline=False, initializes the actual CAT-Seg predictor using Detectron2 config and weights.
+        If baseline=True (or config/weights missing), uses CLIPSeg as fallback/baseline.
+        If baseline=False (or config/weights provided), initializes the actual CAT-Seg predictor using Detectron2 config and weights.
         """
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
         else:
             self.device = device
             
-        self.baseline = baseline or (config is None and weights is None)
-        
+        if baseline is not None:
+            self.baseline = baseline
+        else:
+            self.baseline = (config is None or weights is None)
+            
         if self.baseline:
+            print("[CATSegModel] Initialized in BASELINE mode (using CLIPSeg fallback).")
             self.clipseg = CLIPSegModel(device=self.device)
         else:
+            print(f"[CATSegModel] Initialized in PRODUCTION mode with config='{config}' and weights='{weights}'.")
             # Ensure CAT-Seg repository directory is on sys.path
             abs_catseg_path = os.path.abspath(catseg_path)
             if abs_catseg_path not in sys.path:

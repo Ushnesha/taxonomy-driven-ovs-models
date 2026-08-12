@@ -25,9 +25,10 @@ _REGISTRY = {
 def list_models():
     return list(_REGISTRY.keys())
 
-def get_model(name, device=None, weights=None, config=None, baseline=True):
+def get_model(name, device=None, weights=None, config=None, baseline=None):
     """
     Factory function to retrieve model instance by name.
+    If baseline is None, automatically sets baseline=False when config and weights are provided.
     """
     if name not in _REGISTRY:
         raise ValueError(f"Unknown model architecture: '{name}'. Available: {list_models()}")
@@ -41,11 +42,14 @@ def get_model(name, device=None, weights=None, config=None, baseline=True):
     if name in ["openseg", "sam_clip", "grounded_sam", "sam_siglip"]:
         kwargs["weights"] = weights
         if name == "openseg":
-            kwargs["baseline"] = baseline
+            kwargs["baseline"] = baseline if baseline is not None else (weights is None)
     elif name in ["ovseg", "san", "catseg"]:
         kwargs["config"] = config
         kwargs["weights"] = weights
-        kwargs["baseline"] = baseline
+        if baseline is not None:
+            kwargs["baseline"] = baseline
+        else:
+            kwargs["baseline"] = (config is None or weights is None)
         
     return model_cls(**kwargs)
 
