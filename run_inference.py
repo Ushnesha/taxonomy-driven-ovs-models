@@ -186,7 +186,7 @@ def main():
                         print(f"Error: COCO annotations not found at {bm_hp.COCO_ANN}")
                         sys.exit(1)
                     coco_obj = COCO(bm_hp.COCO_ANN)
-                image_pil = get_img(img_src_id, coco_obj)
+                image_pil = get_img(img_src_id, coco=coco_obj, img_url=img_data.get("img_url"), filename=img_data.get("filename"))
             elif img_src == "ade20k":
                 if ade_dataset is None:
                     print("Loading ADE20K dataset helper...")
@@ -212,7 +212,7 @@ def main():
                         print(f"Error: COCO annotations not found at {bm_hp.COCO_ANN}")
                         sys.exit(1)
                     coco_obj = COCO(bm_hp.COCO_ANN)
-                image_pil = get_img(img_src_id, coco_obj)
+                image_pil = get_img(img_src_id, coco=coco_obj, img_url=img_data.get("img_url"), filename=img_data.get("filename"))
 
             if image_pil is None:
                 print(f"Error: Failed to load PIL Image for image ID {img_data['img_id']}")

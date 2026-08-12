@@ -24,23 +24,60 @@ def get_objects_from_annotations(annotations, coco):
         img_ids_per_cat[category_id].append(ann['image_id'])
     return ground_truth_objects, img_ids_per_cat
 
-def get_img(image_id, coco):
+def get_img(image_id, coco=None, img_url=None, filename=None):
     """
-    Get image by image ID. First checks local 'val2017' directory.
-    Falls back to COCO URL if local file is not found.
+    Get image by image ID, filename, or URL. First checks local image directories.
+    Falls back to provided img_url, COCO metadata, or standard COCO URL format.
     """
-    # COCO image filenames are 12 digits zero-padded
-    local_path = os.path.join("val2017", f"{image_id:012d}.jpg")
-    if os.path.exists(local_path):
+    if isinstance(image_id, int):
+        fn = f"{image_id:012d}.jpg"
+    elif isinstance(image_id, str) and image_id.isdigit():
+        fn = f"{int(image_id):012d}.jpg"
+    else:
+        fn = filename or (str(image_id) if isinstance(image_id, str) else None)
+
+    local_dirs = [
+        "val2017",
+        "train2017",
+        "images",
+        os.path.join("datasets", "coco", "val2017"),
+        os.path.join("datasets", "coco", "train2017"),
+    ]
+
+    if fn:
+        for d in local_dirs:
+            local_path = os.path.join(d, fn)
+            if os.path.exists(local_path):
+                try:
+                    return Image.open(local_path).convert("RGB")
+                except Exception:
+                    pass
+
+    if img_url:
         try:
-            return Image.open(local_path).convert("RGB")
+            return load_image(img_url)
         except Exception:
             pass
-            
-    img_meta = coco.loadImgs(image_id)[0]
-    url = img_meta['coco_url']
-    # load_image handles both local paths and URLs
-    return load_image(url)
+
+    if coco is not None and hasattr(coco, "loadImgs"):
+        try:
+            imgs = coco.loadImgs(image_id)
+            if imgs and len(imgs) > 0 and "coco_url" in imgs[0]:
+                url = imgs[0]["coco_url"]
+                if url:
+                    return load_image(url)
+        except (KeyError, IndexError, Exception):
+            pass
+
+    if isinstance(image_id, (int, str)) and str(image_id).isdigit():
+        val_url = f"http://images.cocodataset.org/val2017/{int(image_id):012d}.jpg"
+        try:
+            return load_image(val_url)
+        except Exception:
+            train_url = f"http://images.cocodataset.org/train2017/{int(image_id):012d}.jpg"
+            return load_image(train_url)
+
+    raise ValueError(f"Could not load image for image_id: {image_id}")
 
 def decode_annotations_to_masks(annotations, h, w):
     """
