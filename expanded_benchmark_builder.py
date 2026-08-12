@@ -14,22 +14,79 @@ WordNet-first: if WordNet gives < 2 synonyms, BabelNet supplements.
 All internal words use underscore form; display form uses spaces.
 """
 
+from PIL import TiffImagePlugin
 import json, os
 from collections import defaultdict
 import numpy as np
+import pickle
+# from expanded_benchmark_helpers import (
+#     COCO_80, DATA_DIR, COCO_ANN,
+#     load_coco, get_cat_name_to_id, download_image, get_gt_mask,
+#     to_wn_form, to_display_form,
+#     find_best_synset, build_word_sets_from_synset,
+#     supplement_word_sets_with_babelnet,
+# )
 
-from expanded_benchmark_helpers import (
-    COCO_80, DATA_DIR, COCO_ANN,
-    load_coco, get_cat_name_to_id, download_image, get_gt_mask,
-    to_wn_form, to_display_form,
-    find_best_synset, build_word_sets_from_synset,
-    supplement_word_sets_with_babelnet,
-)
+from expanded_benchmark_helpers import *
 
 # ── Output paths ──
 POS_PATH = os.path.join(DATA_DIR, "positive_set.json")
 NEG_PATH = os.path.join(DATA_DIR, "negative_set.json")
 WS_PATH  = os.path.join(DATA_DIR, "word_sets.json")
+METADATA_PATH  = os.path.join(DATA_DIR, "img_metadata.pkl")
+WS2_PATH  = os.path.join(DATA_DIR, "word_sets_v2.json")
+POS2_PATH = os.path.join(DATA_DIR, "positive_set_v2.json")
+NEG2_PATH = os.path.join(DATA_DIR, "negative_set_v2.json")
+
+
+VOC_CLASSES = [
+    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", 
+    "bus", "car", "cat", "chair", "cow", "diningtable", "dog", 
+    "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", 
+    "train", "tvmonitor"
+]
+VOC_COLORMAP = [
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+    [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
+    [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
+    [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
+    [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
+    [0, 64, 128]
+]
+VOC_CLS_TO_IDX = {cls: idx for idx, cls in enumerate(VOC_CLASSES)}
+
+def extract_gt_objects_and_masks(dataset_item):
+    """
+    Parses a single dataset item dictionary with keys 'image' and 'mask'.
+    Returns:
+        gt_objects (list): List of class names present in the image.
+        gt_bin_masks (list): List of zlib-compressed binary masks.
+    """
+    import zlib
+    mask_img = dataset_item["mask"]
+    
+    # Convert mask PIL image to numpy array of shape (H, W, 3)
+    mask_np = np.array(mask_img.convert("RGB"))
+    
+    gt_objects = []
+    gt_bin_masks = []
+    
+    # Loop through foreground classes (1 to 20)
+    for class_id in range(1, len(VOC_CLASSES)):
+        class_name = VOC_CLASSES[class_id]
+        color = VOC_COLORMAP[class_id]
+        
+        # Check where the RGB channels match this class color
+        binary_mask = (mask_np == color).all(axis=-1)
+        
+        # If the class is present in the image, keep it
+        if binary_mask.any():
+            gt_objects.append(class_name)
+            # Store as compressed binary mask of uint8 (0 or 1)
+            compressed = zlib.compress(binary_mask.astype(np.uint8).tobytes())
+            gt_bin_masks.append(compressed)
+            
+    return gt_objects, gt_bin_masks
 
 
 def build_positive_negative_sets(coco=None, force_rebuild=False):
@@ -86,6 +143,38 @@ def build_positive_negative_sets(coco=None, force_rebuild=False):
     print(f"  Saved -> {NEG_PATH}")
 
     return positive_set, negative_set, all_cat_names
+
+from collections import defaultdict
+def build_pos_neg_sets_from_bnchmrk(img_bnch):
+    """
+    Builds positive and negative image sets for categories in the benchmark.
+    
+    Returns:
+      positive_set: {category: [img_ids where category exists]}
+      negative_set: {category: [img_ids where category does NOT exist]}
+    """
+    # 1. Collect all unique image IDs in this benchmark
+    all_img_ids = [img["img_id"] for img in img_bnch]
+    all_img_ids_set = set(all_img_ids)
+    
+    # 2. Build the positive set
+    positive_set = defaultdict(list)
+    for img in img_bnch:
+        img_id = img["img_id"]
+        for cat in img["gt_objects"]:
+            if img_id not in positive_set[cat]:
+                positive_set[cat].append(img_id)
+                
+    # Sort positive lists for consistency
+    positive_set = {cat: sorted(ids) for cat, ids in positive_set.items()}
+    
+    # 3. Build the negative set (All IDs minus positive IDs)
+    negative_set = {}
+    for cat, pos_ids in positive_set.items():
+        pos_set = set(pos_ids)
+        negative_set[cat] = sorted(list(all_img_ids_set - pos_set))
+        
+    return positive_set, negative_set
 
 
 def build_word_sets(force_rebuild=False, use_babelnet=True):
@@ -199,6 +288,557 @@ def build_word_sets(force_rebuild=False, use_babelnet=True):
 
     return word_sets, level_counts, report
 
+def process_single_coco_image(img_id, coco_dataset):
+    """Worker function to process a single COCO image."""
+    img_meta = coco_dataset.loadImgs(img_id)[0]
+    h, w = img_meta["height"], img_meta["width"]
+
+    gt_objects = []
+    gt_bin_masks = []
+    anns = get_anns_for_img_id(img_id, coco_dataset)
+    
+    for ann in anns:
+        category = coco_dataset.loadCats(ann["category_id"])[0]
+        cat_name = category["name"]
+        if cat_name not in gt_objects:
+            gt_objects.append(cat_name)
+            mask = get_gt_mask(coco_dataset, img_id, category['id'])
+            if mask is not None:
+                import zlib
+                gt_bin_masks.append(zlib.compress(mask.tobytes()))
+            else:
+                gt_bin_masks.append(b"")
+            
+    return {
+        "img_src" : "coco",
+        "img_src_id": img_id,
+        "img_id" : f"coco_{img_id}",
+        "width": w,
+        "height": h,
+        "filename": img_meta["file_name"],
+        "img_url": img_meta.get("coco_url", ""),
+        "gt_objects": gt_objects,
+        "gt_bin_masks": gt_bin_masks
+    }
+
+def create_benchmark_from_coco(coco_dataset, img_ids_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    img_ids = img_ids_to_process
+    if not img_ids:
+        return img_bnch, cat_bnch
+        
+    # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
+    print("Building taxonomy for COCO categories...")
+    for img_id in img_ids:
+        anns = get_anns_for_img_id(img_id, coco_dataset)
+        for ann in anns:
+            category = coco_dataset.loadCats(ann["category_id"])[0]
+            cat_name = category["name"]
+            if cat_name not in cat_bnch:
+                definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                    word=cat_name, supporting_words=category["supercategory"]
+                )
+                definition = definition_wn
+                synonyms = list(w_s_wn)
+                hyponyms = list(w_s_hp_wn)
+                hypernyms = list(w_s_he_wn)
+                
+                if not w_s_wn:
+                    definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                        word=cat_name, supporting_words=category["supercategory"]
+                    )
+                    definition = definition_bn if definition_wn == "" else definition_wn
+                    synonyms.extend(w_s_bn)
+                    hyponyms.extend(w_s_hp_bn)
+                    hypernyms.extend(w_s_he_bn)
+                
+                cat_bnch[cat_name] = {
+                    "cat_src_id" : category["id"],
+                    "cat_src" : "coco",
+                    "cat_id" : f"coco_{category['id']}",
+                    "definition" : definition,
+                    "synonyms": clean_taxonomy_list(synonyms)[:5],
+                    "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                    "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+                }
+                
+    # 2. Process image masks sequentially
+    from tqdm import tqdm
+    
+    print(f"Processing {len(img_ids)} COCO images...")
+    checkpoint_interval = 100
+    for i, img_id in enumerate(tqdm(img_ids, desc="COCO Images")):
+        result = process_single_coco_image(img_id, coco_dataset)
+        img_bnch.append(result)
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(img_ids):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
+            
+    return img_bnch, cat_bnch
+
+
+def create_benchmark_from_pascalvoc(pascal_dataset, indices_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    if not indices_to_process:
+        return img_bnch, cat_bnch
+
+    # 1. Build taxonomy sequentially first
+    print("Building taxonomy for Pascal VOC categories...")
+    for class_id in range(1, len(VOC_CLASSES)):
+        cat_name = VOC_CLASSES[class_id]
+        if cat_name not in cat_bnch:
+            definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                word=cat_name, supporting_words=[cat_name]
+            )
+            definition = definition_wn
+            synonyms = list(w_s_wn)
+            hyponyms = list(w_s_hp_wn)
+            hypernyms = list(w_s_he_wn)
+            
+            if not w_s_wn:
+                print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                    word=cat_name, supporting_words=[cat_name]
+                )
+                definition = definition_bn if definition_wn == "" else definition_wn
+                synonyms.extend(w_s_bn)
+                hyponyms.extend(w_s_hp_bn)
+                hypernyms.extend(w_s_he_bn)
+            
+            cat_bnch[cat_name] = {
+                "cat_src_id": class_id,
+                "cat_src": "pascalvoc",
+                "cat_id": f"pascalvoc_{class_id}",
+                "definition": definition,
+                "synonyms": clean_taxonomy_list(synonyms)[:5],
+                "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+            }
+
+    # 2. Process Pascal VOC images
+    from tqdm import tqdm
+    print(f"Processing {len(indices_to_process)} Pascal VOC images...")
+    checkpoint_interval = 100
+    for i, idx in enumerate(tqdm(indices_to_process, desc="Pascal VOC Images")):
+        data = pascal_dataset[idx]
+        img_pil = data["image"]
+        w, h = img_pil.size
+        
+        gt_objects, gt_bin_masks = extract_gt_objects_and_masks(data)
+        
+        img_bnch.append({
+            "img_src": "pascalvoc",
+            "img_src_id": idx,
+            "img_id": f"pascalvoc_{idx}",
+            "width": w,
+            "height": h,
+            "filename": "",
+            "img_url": "",
+            "gt_objects": gt_objects,
+            "gt_bin_masks": gt_bin_masks
+        })
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
+            
+    return img_bnch, cat_bnch
+
+
+def create_benchmark_from_lvis(lvis_data, indices_to_process, img_bnch=[], cat_bnch={}):
+    if not indices_to_process:
+        return img_bnch, cat_bnch
+
+    # 1. Build maps for fast lookup
+    cat_id_to_meta = {cat["id"]: cat for cat in lvis_data["categories"]}
+    
+    # We want indices_to_process to index into the lvis_data["images"] list
+    target_images = [lvis_data["images"][idx] for idx in indices_to_process]
+    target_image_ids = {img["id"] for img in target_images}
+    
+    # Group annotations by image_id
+    img_id_to_anns = defaultdict(list)
+    for ann in lvis_data["annotations"]:
+        if ann["image_id"] in target_image_ids:
+            img_id_to_anns[ann["image_id"]].append(ann)
+            
+    # 2. Build taxonomy sequentially first (handles API/NLTK locks safely)
+    print("Building taxonomy for LVIS categories...")
+    present_cat_ids = set()
+    for img_id in target_image_ids:
+        for ann in img_id_to_anns[img_id]:
+            present_cat_ids.add(ann["category_id"])
+            
+    for cat_id in present_cat_ids:
+        cat_meta = cat_id_to_meta[cat_id]
+        cat_name = cat_meta["name"].replace("_", " ")
+        
+        if cat_name not in cat_bnch:
+            definition = cat_meta.get("def", "")
+            syns = cat_meta.get("synonyms", [])
+            synset = cat_meta.get("synset", None)
+            definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                word=cat_name, supporting_words=syns, synset=synset
+            )
+            definition = definition_wn if definition == "" else definition
+            synonyms = list(w_s_wn)
+            hyponyms = list(w_s_hp_wn)
+            hypernyms = list(w_s_he_wn)
+            
+            if not w_s_wn:
+                print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                    word=cat_name, supporting_words=syns
+                )
+                definition = definition_bn if definition == "" else definition
+                synonyms.extend(w_s_bn)
+                hyponyms.extend(w_s_hp_bn)
+                hypernyms.extend(w_s_he_bn)
+                
+            cat_bnch[cat_name] = {
+                "cat_src_id": cat_id,
+                "cat_src": "lvis",
+                "cat_id": f"lvis_{cat_id}",
+                "definition": definition,
+                "synonyms": clean_taxonomy_list(synonyms)[:5],
+                "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+            }
+            
+    # 3. Process image masks
+    from tqdm import tqdm
+    import zlib
+    
+    print(f"Processing {len(indices_to_process)} LVIS images...")
+    checkpoint_interval = 100
+    
+    for i, idx in enumerate(tqdm(indices_to_process, desc="LVIS Images")):
+        img_meta = lvis_data["images"][idx]
+        img_id = img_meta["id"]
+        w, h = img_meta["width"], img_meta["height"]
+        
+        # Group annotations by category name to merge masks
+        cat_to_anns = defaultdict(list)
+        for ann in img_id_to_anns[img_id]:
+            cat_name = cat_id_to_meta[ann["category_id"]]["name"].replace("_", " ")
+            cat_to_anns[cat_name].append(ann)
+            
+        gt_objects = []
+        gt_bin_masks = []
+        
+        for cat_name, anns in cat_to_anns.items():
+            merged_mask = np.zeros((h, w), dtype=np.uint8)
+            for ann in anns:
+                mask = decode_lvis_ann_to_mask(ann, h, w)
+                if mask is not None:
+                    merged_mask = np.maximum(merged_mask, mask)
+            
+            gt_objects.append(cat_name)
+            gt_bin_masks.append(zlib.compress(merged_mask.tobytes()))
+            
+        img_bnch.append({
+            "img_src": "lvis",
+            "img_src_id": img_id,
+            "img_id": f"lvis_{img_id}",
+            "width": w,
+            "height": h,
+            "filename": img_meta.get("file_name", ""),
+            "img_url": img_meta.get("coco_url", ""),
+            "gt_objects": gt_objects,
+            "gt_bin_masks": gt_bin_masks
+        })
+        
+        # Periodic crash-safe checkpointing
+        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+            tmp_path = METADATA_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, METADATA_PATH)
+            
+            tmp_ws_path = WS2_PATH + ".tmp"
+            with open(tmp_ws_path, "w") as f:
+                json.dump(cat_bnch, f, indent=2)
+            os.replace(tmp_ws_path, WS2_PATH)
+            
+    return img_bnch, cat_bnch
+
+
+def process_single_ade_image_data(idx, data, ade_dataset_full=None):
+    """Worker function to process a single ADE20K image data dict."""
+    # Try to get width and height from instances (which is extremely fast and avoids decoding raw image)
+    instances = data.get("instances", [])
+    fallback_img = None
+    if instances:
+        w, h = instances[0].size
+    elif ade_dataset_full is not None:
+        full_data = ade_dataset_full[idx]
+        fallback_img = full_data["image"]
+        w, h = fallback_img.size
+    else:
+        # Fallback default
+        w, h = 256, 256
+        
+    img_id = int(os.path.splitext(data['filename'])[0].split('_')[-1])
+
+    # Group object instances and masks by category name
+    objects_by_cat = {}
+    for obj_id, obj in enumerate(data["objects"]):
+        cat_name = obj["raw_name"]
+        if cat_name not in objects_by_cat:
+            objects_by_cat[cat_name] = []
+        objects_by_cat[cat_name].append(data["instances"][obj_id])
+
+    gt_objects = []
+    gt_bin_masks = []
+    
+    for cat_name, masks in objects_by_cat.items():
+        # Combine all masks for this category using np.maximum
+        merged_mask = np.zeros((h, w), dtype=np.uint8)
+        for mask_img in masks:
+            merged_mask = np.maximum(merged_mask, (np.array(mask_img) > 0).astype(np.uint8))
+            
+        gt_objects.append(cat_name)
+        # Compress the mask to save massive memory
+        import zlib
+        gt_bin_masks.append(zlib.compress(merged_mask.tobytes()))
+        
+    # Explicitly close PIL images to prevent memory leaks
+    for mask_img in instances:
+        mask_img.close()
+    if fallback_img is not None:
+        fallback_img.close()
+        
+    return {
+        "img_src" : "ade20k",
+        "img_src_id": img_id,
+        "img_id" : f"ade20k_{img_id}",
+        "width": w,
+        "height": h,
+        "filename": data["filename"],
+        "img_url": "",
+        "gt_objects": gt_objects,
+        "gt_bin_masks": gt_bin_masks
+    }
+
+def create_benchmark_from_ade20K(ade_dataset, indices_to_process, img_bnch=[], cat_bnch={}, num_workers=8):
+    if not indices_to_process:
+        return img_bnch, cat_bnch
+        
+    # Remove 'image' and 'segmentations' columns to avoid decoding/caching them during processing
+    ade_dataset_light = ade_dataset.remove_columns(["image", "segmentations"])
+
+    # 1. Build taxonomy sequentially first (handles API/NLTK locks safely)
+    print("Building taxonomy for ADE20K categories...")
+    # Select only the 'objects' column to avoid loading and decoding heavy image/mask data
+    objects_column = ade_dataset_light.select(indices_to_process)["objects"]
+    for objects in objects_column:
+        for obj in objects:
+            cat_name = obj["raw_name"]
+            if cat_name not in cat_bnch:
+                hypernyms = obj["hypernym"] if len(obj["hypernym"]) > 0 else []
+                definition_wn, w_s_wn, w_s_hp_wn, w_s_he_wn = build_word_sets_from_synset_v2(
+                    word=cat_name, supporting_words=obj["hypernym"][:2]
+                )
+                definition = definition_wn
+                synonyms = list(w_s_wn)
+                hyponyms = list(w_s_hp_wn)
+                hypernyms = list(w_s_he_wn)
+                
+                if not w_s_wn:
+                    print(f"WordNet failed/insufficient for '{cat_name}'. Querying BabelNet API...")
+                    definition_bn, w_s_bn, w_s_hp_bn, w_s_he_bn = supplement_word_sets_with_babelnet_v2(
+                        word=cat_name, supporting_words=obj["hypernym"][:2]
+                    )
+                    definition = definition_bn if definition_wn == "" else definition_wn
+                    synonyms.extend(w_s_bn)
+                    hyponyms.extend(w_s_hp_bn)
+                    hypernyms.extend(w_s_he_wn)
+                
+                cat_bnch[cat_name] = {
+                    "cat_src_id" : obj['name_ndx'],
+                    "cat_src" : "ade20k",
+                    "cat_id" : f"ade20k_{obj['name_ndx']}",
+                    "definition" : definition,
+                    "synonyms": clean_taxonomy_list(synonyms)[:5],
+                    "hyponyms": clean_taxonomy_list(hyponyms)[:5],
+                    "hypernyms": clean_taxonomy_list(hypernyms)[:5]
+                }
+                
+    # 2. Process image masks in parallel (safe with ThreadPoolExecutor since memory is shared and GIL is released during Pillow C-decodes)
+    from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor
+    import pyarrow as pa
+    import gc
+    
+    print(f"Processing {len(indices_to_process)} ADE20K images with {num_workers} threads...")
+    checkpoint_interval = 100
+    
+    # Select the subset of rows to iterate sequentially (prevents PyArrow index-caching overhead)
+    sub_dataset = ade_dataset_light.select(indices_to_process)
+    
+    def worker(item):
+        i, data = item
+        idx = indices_to_process[i]
+        return process_single_ade_image_data(idx, data, ade_dataset)
+        
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Use tqdm to monitor the progress of the parallel map
+        for i, result in enumerate(tqdm(executor.map(worker, enumerate(sub_dataset)), total=len(sub_dataset), desc="ADE20K Images")):
+            img_bnch.append(result)
+            
+            # Free memory frequently in the main thread
+            if (i + 1) % 20 == 0:
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+                
+            # Periodic crash-safe checkpointing
+            if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(indices_to_process):
+                tmp_path = METADATA_PATH + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, METADATA_PATH)
+                
+                tmp_ws_path = WS2_PATH + ".tmp"
+                with open(tmp_ws_path, "w") as f:
+                    json.dump(cat_bnch, f, indent=2)
+                os.replace(tmp_ws_path, WS2_PATH)
+                
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+            
+    return img_bnch, cat_bnch
+
+def build_benchmark(coco_dataset, ade_dataset, pascal_dataset, lvis_dataset, limit_coco=5000, limit_ade=2000, limit_pascal=1500, limit_lvis=5000):
+    import pickle
+    
+    # 1. Load existing cache if present
+    img_bnch = []
+    cat_bnch = {}
+    
+    if os.path.exists(METADATA_PATH):
+        print(f"Loading existing benchmark images from {METADATA_PATH}...")
+        try:
+            with open(METADATA_PATH, "rb") as f:
+                img_bnch = pickle.load(f)
+            print(f"  Loaded {len(img_bnch)} previously processed images.")
+        except Exception as e:
+            print(f"  Warning: Failed to load existing metadata, starting fresh: {e}")
+            img_bnch = []
+            
+    if os.path.exists(WS2_PATH):
+        print(f"Loading existing category taxonomy from {WS2_PATH}...")
+        try:
+            with open(WS2_PATH, "r") as f:
+                cat_bnch = json.load(f)
+            print(f"  Loaded {len(cat_bnch)} category taxonomy entries.")
+        except Exception as e:
+            print(f"  Warning: Failed to load taxonomy cache: {e}")
+            cat_bnch = {}
+
+    # 2. Determine what has already been processed
+    processed_coco_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "coco"}
+    processed_ade_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "ade20k"}
+    processed_pascal_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "pascalvoc"}
+    processed_lvis_ids = {img["img_src_id"] for img in img_bnch if img["img_src"] == "lvis"}
+
+    # 3. Filter COCO images
+    print("Checking COCO cache...")
+    all_coco_img_ids = coco_dataset.getImgIds()
+    coco_target_ids = all_coco_img_ids[:limit_coco]
+    coco_ids_to_process = [img_id for img_id in coco_target_ids if img_id not in processed_coco_ids]
+
+    # 4. Filter ADE20K images
+    print("Checking ADE20K cache...")
+    ade_filenames = ade_dataset["filename"]
+    ade_img_ids = [int(os.path.splitext(f)[0].split('_')[-1]) for f in ade_filenames]
+    ade_target_indices = list(range(min(limit_ade, len(ade_dataset))))
+    ade_indices_to_process = [idx for idx in ade_target_indices if ade_img_ids[idx] not in processed_ade_ids]
+
+    # 5. Filter Pascal VOC images
+    print("Checking Pascal VOC cache...")
+    pascal_target_indices = list(range(min(limit_pascal, len(pascal_dataset))))
+    pascal_indices_to_process = [idx for idx in pascal_target_indices if idx not in processed_pascal_ids]
+
+    # 6. Filter LVIS images
+    print("Checking LVIS cache...")
+    lvis_target_indices = list(range(min(limit_lvis, len(lvis_dataset["images"]))))
+    lvis_indices_to_process = [idx for idx in lvis_target_indices if lvis_dataset["images"][idx]["id"] not in processed_lvis_ids]
+
+    # 7. Process COCO if needed
+    if coco_ids_to_process:
+        print(f"Processing COCO ({len(coco_ids_to_process)} new images out of target limit {limit_coco})...")
+        img_bnch, cat_bnch = create_benchmark_from_coco(
+            coco_dataset, coco_ids_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_coco} target COCO images are already processed.")
+
+    # 8. Process ADE20K if needed
+    if ade_indices_to_process:
+        print(f"Processing ADE ({len(ade_indices_to_process)} new images out of target limit {limit_ade})...")
+        img_bnch, cat_bnch = create_benchmark_from_ade20K(
+            ade_dataset, ade_indices_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_ade} target ADE20K images are already processed.")
+
+    # 9. Process Pascal VOC if needed
+    if pascal_indices_to_process:
+        print(f"Processing Pascal VOC ({len(pascal_indices_to_process)} new images out of target limit {limit_pascal})...")
+        img_bnch, cat_bnch = create_benchmark_from_pascalvoc(
+            pascal_dataset, pascal_indices_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_pascal} target Pascal VOC images are already processed.")
+
+    # 10. Process LVIS if needed
+    if lvis_indices_to_process:
+        print(f"Processing LVIS ({len(lvis_indices_to_process)} new images out of target limit {limit_lvis})...")
+        img_bnch, cat_bnch = create_benchmark_from_lvis(
+            lvis_dataset, lvis_indices_to_process, img_bnch=img_bnch, cat_bnch=cat_bnch
+        )
+    else:
+        print(f"All {limit_lvis} target LVIS images are already processed.")
+
+    # 11. Save updated sets to disk
+    with open(METADATA_PATH, "wb") as f:
+        pickle.dump(img_bnch, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"\n  Saved -> {METADATA_PATH} (total images: {len(img_bnch)})")
+    
+    with open(WS2_PATH, "w") as f:
+        json.dump(cat_bnch, f, indent=2)
+    print(f"  Saved -> {WS2_PATH} (total categories: {len(cat_bnch)})")
+    
+    # 12. Rebuild positive/negative sets from combined metadata and save
+    print("Rebuilding positive/negative sets...")
+    pos_set, neg_set = build_pos_neg_sets_from_bnchmrk(img_bnch)
+    with open(POS2_PATH, "w") as f:
+        json.dump(pos_set, f, indent=2)
+    print(f"  Saved -> {POS2_PATH}")
+    with open(NEG2_PATH, "w") as f:
+        json.dump(neg_set, f, indent=2)
+    print(f"  Saved -> {NEG2_PATH}")
+
+    return img_bnch, cat_bnch
+
+
+    
+
 
 def build_all(force_rebuild=False, use_babelnet=True):
     """
@@ -210,11 +850,13 @@ def build_all(force_rebuild=False, use_babelnet=True):
     print("=" * 60)
 
     # 1. Load COCO
-    print("\n[1/3] Loading COCO annotations...")
-    coco = load_coco(COCO_ANN)
+    print("\n[1/4] Loading COCO and ADE20K datasets...")
+    coco = load_coco()
+    ade = load_ade20k()
+
 
     # 2. Positive & negative sets
-    print("\n[2/3] Building positive/negative image sets...")
+    print("\n[2/4] Building positive/negative image sets...")
     positive_set, negative_set, all_cat_names = build_positive_negative_sets(
         coco=coco, force_rebuild=force_rebuild
     )
@@ -226,11 +868,11 @@ def build_all(force_rebuild=False, use_babelnet=True):
     print(f"  Negative: min={min(neg_counts)}, max={max(neg_counts)}, mean={np.mean(neg_counts):.0f}")
 
     # 3. Word sets
-    print("\n[3/3] Building word sets...")
+    print("\n[3/4] Building word sets...")
     word_sets, level_counts, report = build_word_sets(
         force_rebuild=force_rebuild, use_babelnet=use_babelnet
     )
-
+    
     # Summary
     print("\n" + "=" * 60)
     print("BUILD COMPLETE")
@@ -259,4 +901,16 @@ def build_all(force_rebuild=False, use_babelnet=True):
 
 # ── Standalone execution ──
 if __name__ == "__main__":
-    build_all(force_rebuild=False, use_babelnet=True)
+    # build_all(force_rebuild=False, use_babelnet=True)
+    coco_dataset = load_coco()
+    ade_dataset = load_ade20k()
+    pascal_dataset = load_pascalvoc()
+    lvis_dataset = load_lvis()
+    len_coco = len(coco_dataset.getImgIds())
+    len_ade = len(ade_dataset)
+    len_pascal = len(pascal_dataset)
+    len_lvis = len(lvis_dataset["images"])
+    build_benchmark(
+        coco_dataset, ade_dataset, pascal_dataset, lvis_dataset,
+        limit_coco=len_coco, limit_ade=len_ade, limit_pascal=len_pascal, limit_lvis=len_lvis
+    )

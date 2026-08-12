@@ -4,6 +4,7 @@ WordNet-first, BabelNet-fallback approach.
 All internal word lookups use underscores (spaces converted).
 """
 
+from IPython.core import async_helpers
 import sys, os, json, threading
 import torch
 import numpy as np
@@ -11,12 +12,21 @@ from PIL import Image
 from io import BytesIO
 import requests
 from collections import defaultdict
+from datasets import load_dataset
+# pyrefly: ignore [missing-import]
+from sentence_transformers import SentenceTransformer, util
+device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
 # ── Paths ──
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-COCO_ANN  = os.path.join(REPO_ROOT, "annotations", "instances_val2017.json")
+COCO_ANN  = os.path.join(REPO_ROOT, "datasets", "coco", "instances_val2017.json")
+ADE20K_PATH = os.path.join(REPO_ROOT, "datasets", "ade20k")
+PASCALVOC_PATH = os.path.join(REPO_ROOT, "datasets", "pascalvoc")
 DATA_DIR  = os.path.join(REPO_ROOT, "data")
 COCO_URL  = "http://images.cocodataset.org/val2017/{:012d}.jpg"
+LVIS_PATH = os.path.join(REPO_ROOT, "datasets", "lvis")
+LVIS_ANN = os.path.join(LVIS_PATH, "lvis_v1_val.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ── BabelNet config ──
@@ -164,10 +174,60 @@ def compute_iou(pred_mask, gt_mask):
 # COCO utilities
 # ═══════════════════════════════════════════════
 
-def load_coco(ann_path=None):
+def load_coco(ann_path=COCO_ANN):
+    import zipfile
     from pycocotools.coco import COCO
-    path = ann_path or COCO_ANN
+    
+    path = ann_path
+    
+    if not os.path.exists(path):
+        print(f"COCO annotations not found at {path}. Downloading...")
+        parent_dir = os.path.dirname(path)
+        os.makedirs(parent_dir, exist_ok=True)
+        
+        # Download the annotations zip file
+        zip_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+        zip_path = os.path.join(parent_dir, "annotations_trainval2017.zip")
+        
+        try:
+            r = requests.get(zip_url, stream=True)
+            r.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("Download complete. Extracting instances_val2017.json...")
+            
+            # Extract only the instances_val2017.json file
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                val_ann_member = "annotations/instances_val2017.json"
+                if val_ann_member in zip_ref.namelist():
+                    zip_ref.extract(val_ann_member, path=parent_dir)
+                    extracted_path = os.path.join(parent_dir, val_ann_member)
+                    os.rename(extracted_path, path)
+                    
+                    # Remove the empty annotations folder created by extraction
+                    extracted_dir = os.path.join(parent_dir, "annotations")
+                    if os.path.exists(extracted_dir):
+                        os.rmdir(extracted_dir)
+                else:
+                    zip_ref.extractall(path=parent_dir)
+            
+            # Clean up the zip file
+            os.remove(zip_path)
+            print("Extraction complete and temporary files cleaned up.")
+            
+        except Exception as e:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            raise RuntimeError(f"Failed to download/extract COCO annotations: {e}")
+            
     return COCO(path)
+
+def get_anns_for_img_id(image_id, coco):
+    ann_ids = coco.getAnnIds(imgIds=image_id)
+    annotations = coco.loadAnns(ann_ids)
+    return annotations
+
 
 def get_cat_name_to_id(coco):
     return {cat["name"]: cat["id"] for cat in coco.loadCats(coco.getCatIds())}
@@ -198,6 +258,203 @@ def get_images_for_category(coco, cat_id, n=5, seed=42):
     rng = np.random.RandomState(seed)
     rng.shuffle(img_ids)
     return img_ids[:n]
+
+# ═══════════════════════════════════════════════
+# ADE20K utilities
+# ═══════════════════════════════════════════════
+
+def load_ade20k(local_path=ADE20K_PATH, split="validation"):
+    """Loads the ADE20K dataset from local cache if available, otherwise downloads it."""
+    import os
+    from datasets import load_dataset
+    
+    # Save the original environment state
+    orig_offline = os.environ.get("HF_DATASETS_OFFLINE")
+    
+    try:
+        # Enforce offline mode to avoid remote hub latency
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        dataset = load_dataset("uva-cv-lab/ade20k-150", cache_dir=local_path)[split]
+        print(f"Loaded ADE20K {split} dataset from local cache.")
+        return dataset
+    except Exception:
+        print("ADE20K dataset not found in local cache. Downloading from Hugging Face...")
+        # Disable offline mode to allow downloading
+        os.environ["HF_DATASETS_OFFLINE"] = "0"
+        try:
+            dataset = load_dataset("uva-cv-lab/ade20k-150", cache_dir=local_path)[split]
+            print("Download and load complete.")
+            return dataset
+        finally:
+            # Restore the original environment state
+            if orig_offline is not None:
+                os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+            else:
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
+    finally:
+        # Restore the original environment state if loading succeeded
+        if orig_offline is not None:
+            os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+        else:
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
+
+def get_gt_mask_for_ade(data, cat_name):
+    """
+    Given an ADE20K data item and a category name, finds all instances 
+    matching that category and merges their masks using np.maximum.
+    """
+    import numpy as np
+    
+    # Get image dimensions (width, height)
+    w, h = data["image"].size
+    gt = np.zeros((h, w), dtype=np.uint8)
+    
+    found = False
+    for idx, obj in enumerate(data["objects"]):
+        if obj["raw_name"] == cat_name:
+            # Get the binary mask for this instance
+            instance_mask = (np.array(data["instances"][idx]) > 0).astype(np.uint8)
+            # Perform logical OR (merge)
+            gt = np.maximum(gt, instance_mask)
+            found = True
+            
+    return gt if found else None
+
+# ═══════════════════════════════════════════════
+# Pascal VOC utilities
+# ═══════════════════════════════════════════════
+def load_pascalvoc(local_path=PASCALVOC_PATH, split="val"):
+    """Loads the PASCAL VOC dataset from local cache if available, otherwise downloads it."""
+    import os
+    from datasets import load_dataset
+    
+    # Save the original environment state
+    orig_offline = os.environ.get("HF_DATASETS_OFFLINE")
+    
+    try:
+        # Enforce offline mode to avoid remote hub latency
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        dataset = load_dataset("nateraw/pascal-voc-2012", split=split, cache_dir=local_path)
+        print(f"Loaded PASCAL VOC {split} dataset from local cache.")
+        return dataset
+    except Exception:
+        print("PASCAL VOC dataset not found in local cache. Downloading from Hugging Face...")
+        # Disable offline mode to allow downloading
+        os.environ["HF_DATASETS_OFFLINE"] = "0"
+        try:
+            dataset = load_dataset("nateraw/pascal-voc-2012", split=split, cache_dir=local_path)
+            print("Download and load complete.")
+            return dataset
+        finally:
+            # Restore the original environment state
+            if orig_offline is not None:
+                os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+            else:
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
+    finally:
+        # Restore the original environment state if loading succeeded
+        if orig_offline is not None:
+            os.environ["HF_DATASETS_OFFLINE"] = orig_offline
+        else:
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
+
+# ═══════════════════════════════════════════════
+# LVIS utilities
+# ═══════════════════════════════════════════════
+def load_lvis(local_path=LVIS_PATH, zip_url="https://dl.fbaipublicfiles.com/LVIS/lvis_v1_val.json.zip"):
+    """Downloads, extracts, and loads LVIS v1.0 validation annotations JSON."""
+    import zipfile
+    import requests
+    
+    os.makedirs(local_path, exist_ok=True)
+    json_path = os.path.join(local_path, "lvis_v1_val.json")
+    zip_path = os.path.join(local_path, "lvis_v1_val.json.zip")
+    
+    if not os.path.exists(json_path):
+        if not os.path.exists(zip_path):
+            print(f"LVIS annotations not found at {json_path}. Downloading from {zip_url}...")
+            try:
+                r = requests.get(zip_url, stream=True)
+                r.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("Download complete.")
+            except Exception as e:
+                print(f"Error downloading LVIS annotations: {e}")
+                raise e
+        
+        print(f"Extracting LVIS annotations from {zip_path}...")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(local_path)
+            print("Extraction complete.")
+        except Exception as e:
+            print(f"Error extracting LVIS zip: {e}")
+            raise e
+            
+    print(f"Loading LVIS annotations from {json_path}...")
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    return data
+
+def decode_lvis_ann_to_mask(ann, h, w):
+    """
+    Decode LVIS polygon/RLE segmentation into a binary mask.
+    Returns:
+        np.ndarray: [H, W] binary mask of type uint8 (0 or 1)
+    """
+    from pycocotools import mask as maskUtils
+    segm = ann['segmentation']
+    if isinstance(segm, list):
+        # polygon
+        rles = maskUtils.frPyObjects(segm, h, w)
+        rle = maskUtils.merge(rles)
+    elif isinstance(segm, dict):
+        if isinstance(segm['counts'], list):
+            # uncompressed RLE
+            rle = maskUtils.frPyObjects(segm, h, w)
+        else:
+            # RLE
+            rle = segm
+    else:
+        return None
+    return maskUtils.decode(rle)
+
+
+# ═══════════════════════════════════════════════
+# Data Cleaning utilities
+# ═══════════════════════════════════════════════
+def clean_taxonomy_list(raw_list):
+    _ensure_wordnet()
+    from nltk.corpus import wordnet as wn
+    """
+    Cleans a list of taxnomy words by:
+      1. Splitting comma-separated strings into individual elements.
+      2. Normalizing spaces to underscores and converting to lowercase.
+      3. Filtering out misspelled words/typos using WordNet.
+      4. Deduplicating while preserving order.
+    """
+    cleaned = []
+    for item in raw_list:
+        # Split by comma (handles "altar, communion table, Lord's table" -> ['altar', 'communion table', "Lord's table"])
+        parts = [p.strip().lower() for p in item.split(",")]
+        
+        for part in parts:
+            # Replace spaces with underscores
+            part_normalized = part.replace(" ", "_")
+            if not part_normalized:
+                continue
+                
+            # Check if it's already in the cleaned list
+            if part_normalized not in cleaned:
+                # Use WordNet to filter out typos/misspellings
+                # (e.g. "fa\u00e7ade" or "botle" will return [] and be skipped)
+                if wn.synsets(part_normalized) or wn.synsets(part.replace("_", " ")):
+                    cleaned.append(part_normalized)
+                    
+    return cleaned
+
 
 # ═══════════════════════════════════════════════
 # WordNet utilities
@@ -293,6 +550,74 @@ def find_best_synset(word: str):
         return noun_synsets[0]
     return synsets[0]
 
+def find_best_synset_v2(word: str, supporting_words):
+    from nltk.corpus import wordnet as wn
+    _ensure_wordnet()
+
+    # Try exact match (underscore form and display form)
+    word_wn = word.replace(" ", "_")
+    word_display = word.strip().lower()
+    
+    synsets = wn.synsets(word_wn, pos=wn.NOUN)
+    if not synsets:
+        synsets = wn.synsets(word_display, pos=wn.NOUN)
+        
+    # Try lemmatization with morphy for plural forms (e.g. "boxes" -> "box")
+    lemma = None
+    if not synsets:
+        lemma = wn.morphy(word_wn, pos=wn.NOUN)
+        if lemma:
+            synsets = wn.synsets(lemma, pos=wn.NOUN)
+        if not synsets:
+            lemma_display = wn.morphy(word_display, pos=wn.NOUN)
+            if lemma_display:
+                synsets = wn.synsets(lemma_display, pos=wn.NOUN)
+                lemma = lemma_display
+                
+    # Fallback to general synsets (any POS)
+    if not synsets:
+        synsets = wn.synsets(word_wn)
+        if not synsets and lemma:
+            synsets = wn.synsets(lemma)
+            
+    if not synsets:
+        return None, ""
+    if len(synsets) == 1:
+        return synsets[0], synsets[0].definition()
+
+
+
+    # 1. Create a combined context string
+    if isinstance(supporting_words, (list, tuple, set)):
+        context_text = ", ".join(supporting_words)
+    else:
+        context_text = str(supporting_words)
+
+    context_emb = embedding_model.encode(context_text, convert_to_tensor=True)
+    
+    best_synset = None
+    best_definition = ""
+    max_score = -1.0
+    
+    # 2. Score each candidate
+    for s in synsets:
+        definition = ""
+        # Build candidate features: definition + examples + immediate hypernyms
+        if s.definition() and s.definition() != "":
+            definition = s.definition()
+        hypernym_names = [h.name().split('.')[0].replace('_', ' ') for h in s.hypernyms()]
+        candidate_text = f"{definition} {' '.join(s.examples())} {' '.join(hypernym_names)}"
+        
+        candidate_emb = embedding_model.encode(candidate_text, convert_to_tensor=True)
+        score = util.cos_sim(context_emb, candidate_emb).item()
+        
+        if score > max_score:
+            max_score = score
+            best_synset = s
+            best_definition = definition
+
+    return best_synset, best_definition
+
 def build_word_sets_from_synset(synset):
     """
     Given an nltk Synset, return {W_S, W_S_Hp, W_S_Hp_He}.
@@ -320,11 +645,85 @@ def build_word_sets_from_synset(synset):
         "W_S_Hp_He": w_s_hp_he,
     }
 
+def build_word_sets_from_synset_v2(word: str, supporting_words=None, limit=5, synset=None):
+    w_s_hp = []
+    w_s_he = []
+    w_s = []
+    definition = ""
+    if supporting_words is None:
+        supporting_words = [word]
+    if synset is None:
+        synset, definition = find_best_synset_v2(word, supporting_words)
+    elif isinstance(synset, str):
+        from nltk.corpus import wordnet as wn
+        _ensure_wordnet()
+        try:
+            synset = wn.synset(synset)
+            definition = synset.definition()
+        except Exception:
+            synset = None
+    else:
+        try:
+            definition = synset.definition()
+        except Exception:
+            definition = ""
+    
+    if synset:
+        w_s = list(synset.lemma_names())[:5]
+        i = 0
+        for hypo in synset.hyponyms():
+            for lemma in hypo.lemma_names():
+                if lemma not in w_s_hp:
+                    w_s_hp.append(lemma)
+                if i >= limit: break
+        i = 0
+        for hyper in synset.hypernyms():
+            for lemma in hyper.lemma_names():
+                if lemma not in w_s_he:
+                    w_s_he.append(lemma)
+                if i >= limit: break
+
+    return definition, w_s, w_s_hp, w_s_he
+
+def build_synset_group(synset):
+    w_s_hp = []
+    w_s_he = []
+    w_s = []
+    if synset:
+        w_s = list(synset.lemma_names())
+        print(w_s)
+        for hypo in synset.hyponyms():
+            for lemma in hypo.lemma_names():
+                if lemma not in w_s_hp:
+                    w_s_hp.append(lemma)
+        for hyper in synset.hypernyms():
+            for lemma in hyper.lemma_names():
+                if lemma not in w_s_he:
+                    w_s_he.append(lemma)
+
+    return synset.definition(), w_s, w_s_hp, w_s_he
+
 # ═══════════════════════════════════════════════
 # BabelNet fallback
 # ═══════════════════════════════════════════════
 
+BN_CACHE_PATH = os.path.join(DATA_DIR, "babelnet_cache.json")
 _babelnet_cache = {}
+
+def _load_babelnet_cache():
+    global _babelnet_cache
+    if os.path.exists(BN_CACHE_PATH):
+        try:
+            with open(BN_CACHE_PATH, "r") as f:
+                _babelnet_cache = json.load(f)
+            print(f"Loaded {len(_babelnet_cache)} cached BabelNet queries from {BN_CACHE_PATH}")
+        except Exception as e:
+            print(f"Warning: Failed to load BabelNet cache: {e}")
+            _babelnet_cache = {}
+    else:
+        _babelnet_cache = {}
+
+_load_babelnet_cache()
 
 def _babelnet_get(path: str, params: dict, timeout=10):
     """Cached GET request to BabelNet API."""
@@ -341,18 +740,29 @@ def _babelnet_get(path: str, params: dict, timeout=10):
             result = r.json()
     except Exception:
         result = None
-    _babelnet_cache[cache_key] = result
+        
+    if result is not None:
+        _babelnet_cache[cache_key] = result
+        try:
+            with open(BN_CACHE_PATH, "w") as f:
+                json.dump(_babelnet_cache, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to save BabelNet cache: {e}")
     return result
 
-def _babelnet_get_synset_ids(word: str):
+def _babelnet_get_synset_ids(word: str, pos="NOUN"):
     """Get BabelNet synset IDs for a word. Prefer WordNet-sourced IDs."""
-    data = _babelnet_get("getSynsetIds", {"lemma": word, "searchLang": "EN"})
+    params = {"lemma": word, "searchLang": "EN"}
+    if pos:
+        params["pos"] = pos
+    data = _babelnet_get("getSynsetIds", params)
     if not data:
         return []
     # Sort: WordNet-sourced first
     wn_ids = [d["id"] for d in data if d.get("source") == "WN"]
     other_ids = [d["id"] for d in data if d.get("source") != "WN"]
     return wn_ids + other_ids
+
 
 def _babelnet_get_synset_data(synset_id: str):
     """Get full synset data including lemmas and glosses."""
@@ -369,7 +779,7 @@ def _babelnet_extract_english_lemmas(synset_data: dict):
         props = sense.get("properties", {})
         lemma = props.get("simpleLemma", "")
         lang = props.get("language", "")
-        if lang == "EN" and lemma:
+        if lang == "EN" and lemma and lemma.lower().replace(" ", "_") not in lemmas:
             # Convert to underscore form for consistency
             lemmas.append(lemma.lower().replace(" ", "_"))
     return lemmas
@@ -389,6 +799,65 @@ def _babelnet_get_related_lemmas(synset_id: str, edge_types: tuple):
                 target_data = _babelnet_get_synset_data(target_id)
                 related_lemmas.extend(_babelnet_extract_english_lemmas(target_data))
     return related_lemmas
+
+def get_best_synset_id_frm_bn(word: str, supporting_words) -> str:
+    """
+    Finds the best BabelNet Synset ID matching the supporting_words context,
+    robustly handling word formatting (spaces vs. underscores vs. hyphens).
+    """
+    # 1. Normalize the input word
+    word_clean = word.replace("-", " ").replace("_", " ").strip()
+    word_spaced = word_clean
+    word_underscored = word_clean.replace(" ", "_")
+    # 2. Query BabelNet using both formats
+    synset_ids = _babelnet_get_synset_ids(word_spaced)
+    if not synset_ids:
+        synset_ids = _babelnet_get_synset_ids(word_underscored)
+    if not synset_ids:
+        # Final fallback to raw input
+        synset_ids = _babelnet_get_synset_ids(word)
+    if not synset_ids:
+        return None, None, ""
+    if len(synset_ids) == 1:
+        sid = synset_ids[0]
+        data = _babelnet_get_synset_data(sid)
+        definition = ""
+        for gloss in data.get("glosses", []):
+            if gloss.get("language") == "EN":
+                definition = gloss.get("gloss", "")
+                break
+        return sid, data, definition
+
+    # 3. Format the context text dynamically
+    if isinstance(supporting_words, (list, tuple, set)):
+        context_text = ", ".join(supporting_words)
+    else:
+        context_text = str(supporting_words)
+    context_emb = embedding_model.encode(context_text, convert_to_tensor=True)
+    best_synset_id = None
+    best_synset_data = None
+    best_synset_def = ""
+    max_score = -1.0
+    # 4. Score candidates
+    for sid in synset_ids[:5]:  # Check first 5 candidates
+        data = _babelnet_get_synset_data(sid)
+        
+        # Get definition
+        definition = ""
+        for gloss in data.get("glosses", []):
+            if gloss.get("language") == "EN":
+                definition = gloss.get("gloss", "")
+                break
+                
+        # Calculate similarity score
+        candidate_emb = embedding_model.encode(definition, convert_to_tensor=True)
+        score = util.cos_sim(context_emb, candidate_emb).item()
+        if score > max_score and definition != "":
+            max_score = score
+            best_synset_id = sid
+            best_synset_data = data
+            best_synset_def = definition
+    return best_synset_id, best_synset_data, best_synset_def
 
 def supplement_word_sets_with_babelnet(word: str, existing_word_sets: dict):
     """
@@ -454,13 +923,56 @@ def supplement_word_sets_with_babelnet(word: str, existing_word_sets: dict):
 
     return {"W_S": w_s, "W_S_Hp": w_s_hp, "W_S_Hp_He": w_s_hp_he}
 
+
+
+
+def supplement_word_sets_with_babelnet_v2(word: str, supporting_words, limit=5):
+    """
+    If WordNet gives insufficient synonyms (< 2 in W_S), try BabelNet
+    to supplement the word sets. Returns enriched word_sets dict using
+    supporting_words context to disambiguate.
+    """
+    definition = ""
+    w_s, w_s_hp, w_s_he = [], [], []
+    # 1. Find the best synset ID using context
+    best_synset_id, data, definition = get_best_synset_id_frm_bn(word, supporting_words)
+    if not best_synset_id:
+        return definition, w_s, w_s_hp, w_s_he
+    
+    # 2. Extract Synonyms (lemmas from that synset)
+    w_s = _babelnet_extract_english_lemmas(data)
+    word_normalized = word.lower().replace(" ", "_")
+    if word_normalized not in w_s:
+        w_s.insert(0, word_normalized)
+
+    # 3. Extract Hyponyms and Hypernyms via outgoing edges
+    bn_hyponyms = _babelnet_get_related_lemmas(best_synset_id, ("+~", "has-kind"))
+    bn_hypernyms = _babelnet_get_related_lemmas(best_synset_id, ("+@", "is-a"))
+
+    # Format output lists
+    for lemma in bn_hyponyms[:limit]:
+        if lemma not in w_s_hp:
+            w_s_hp.append(lemma)
+
+    for lemma in bn_hypernyms[:limit]:
+        if lemma not in w_s_he:
+            w_s_he.append(lemma)
+
+    return definition, w_s[:limit], w_s_hp, w_s_he
+
 # ═══════════════════════════════════════════════
 # Blending
 # ═══════════════════════════════════════════════
 
 def compute_centroid(embeddings: list):
-    """Unweighted mean of a list of (word, tensor) tuples."""
-    return torch.stack([e for _, e in embeddings]).mean(dim=0)
+    """Unweighted mean of a list of (word, tensor) or (word, tensor, similarity) tuples."""
+    tensors = []
+    for item in embeddings:
+        if isinstance(item, (tuple, list)):
+            tensors.append(item[1])
+        else:
+            tensors.append(item)
+    return torch.stack(tensors).mean(dim=0)
 
 def blend_embedding(query_emb, centroid, alpha):
     """(1-α) * query + α * centroid. Preserves raw norm."""

@@ -136,3 +136,130 @@ class GroundedSAMModel(BaseOVSModel):
                 pred[matched_cat_id] = np.logical_or(pred[matched_cat_id], masks[0]).astype(np.uint8)
                 
         return pred
+
+    def predict_v2(self, image_pil, gt_masks, text_prompts, threshold=0.3):
+        """
+        Predicts binary masks for multiple prompts on a single PIL image.
+        text_prompts can be a list of prompts or a dictionary of {key: prompt_string}.
+        """
+        if isinstance(image_pil, np.ndarray):
+            from PIL import Image
+            image_pil = Image.fromarray(image_pil)
+            img_np = image_pil
+        else:
+            img_np = np.array(image_pil.convert("RGB"))
+            
+        W, H = image_pil.size
+        
+        # Handle list vs dict
+        if isinstance(text_prompts, list):
+            prompts_dict = {p: p for p in text_prompts}
+        else:
+            prompts_dict = text_prompts
+            
+        if not prompts_dict:
+            return {}
+
+        # Normalize helper for string matching
+        def normalize_str(s):
+            if not isinstance(s, str):
+                return ""
+            return s.strip().lower().replace(".", "").replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", "").replace("_", " ").replace("-", " ")
+
+        # Grounding DINO has a 256 token limit. To safely prevent exceeding this limit,
+        # we chunk the prompts into groups of at most 25.
+        chunk_size = 25
+        prompts_keys = list(prompts_dict.keys())
+        pred_masks = {key: np.zeros((H, W), dtype=np.uint8) for key in prompts_dict.keys()}
+
+        # Set SAM image once outside the loop
+        self.sam_predictor.set_image(img_np)
+
+        for k_idx in range(0, len(prompts_keys), chunk_size):
+            chunk_keys = prompts_keys[k_idx : k_idx + chunk_size]
+            sub_prompts_dict = {k: prompts_dict[k] for k in chunk_keys}
+
+            prompt_to_key = {}
+            text_prompts_list = []
+            for key, p_text in sub_prompts_dict.items():
+                norm_p = normalize_str(p_text)
+                prompt_to_key[norm_p] = key
+                text_prompts_list.append(norm_p if norm_p.endswith(".") else f"{norm_p}.")
+
+            # Join prompts for Grounding DINO call
+            text_prompt = " ".join(text_prompts_list)
+
+            # Run Grounding DINO
+            inputs = self.gd_processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                outputs = self.gd_model(**inputs)
+                
+            box_thresh = threshold if threshold < 0.5 else 0.25
+            try:
+                results = self.gd_processor.post_process_grounded_object_detection(
+                    outputs,
+                    inputs.input_ids,
+                    box_threshold=box_thresh,
+                    text_threshold=box_thresh,
+                    target_sizes=[(H, W)]
+                )[0]
+            except TypeError:
+                results = self.gd_processor.post_process_grounded_object_detection(
+                    outputs,
+                    inputs.input_ids,
+                    threshold=box_thresh,
+                    text_threshold=box_thresh,
+                    target_sizes=[(H, W)]
+                )[0]
+
+            boxes = results.get("boxes", [])
+            text_labels = results.get("text_labels")
+            if text_labels is None:
+                text_labels = results.get("labels", [])
+
+            # Diagnostic print for debugging Grounding DINO matching
+            print(f"DEBUG DINO (chunk {k_idx//chunk_size}): prompts={len(chunk_keys)} | boxes={len(boxes)} | labels={text_labels}")
+
+            if len(boxes) > 0:
+                for i in range(len(boxes)):
+                    box = boxes[i].cpu().numpy() # [xmin, ymin, xmax, ymax]
+                    label_str = text_labels[i]
+                    # Ensure label_str is string (might be integer ID in some transformers versions)
+                    if not isinstance(label_str, str):
+                        try:
+                            # Try to decode input token index to string if possible, or fallback
+                            token_id = int(label_str)
+                            label_str = self.gd_processor.tokenizer.decode([token_id])
+                        except Exception:
+                            label_str = str(label_str)
+                            
+                    label_norm = normalize_str(label_str)
+                    
+                    matched_key = None
+                    if label_norm in prompt_to_key:
+                        matched_key = prompt_to_key[label_norm]
+                    else:
+                        for p_norm, key in prompt_to_key.items():
+                            if label_norm in p_norm or p_norm in label_norm:
+                                matched_key = key
+                                break
+                                
+                    if matched_key is not None:
+                        masks, _, _ = self.sam_predictor.predict(
+                            box=box,
+                            multimask_output=False
+                        )
+                        pred_masks[matched_key] = np.logical_or(pred_masks[matched_key], masks[0]).astype(np.uint8)
+                        
+        return pred_masks
+
+    def batch_inference(self, images, image_prompts, threshold=0.3):
+        """
+        Runs batch prediction sequentially over multiple images.
+        """
+        batched_results = []
+        for img, prompts in zip(images, image_prompts):
+            prompts_dict = {p: p for p in prompts}
+            pred_dict = self.predict_v2(img, None, prompts_dict, threshold=threshold)
+            batched_results.append(pred_dict)
+        return batched_results
