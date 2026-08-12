@@ -94,3 +94,48 @@ class CATSegModel(BaseOVSModel):
             pred_masks[cid] = (probs_np[idx] > threshold).astype(np.uint8)
             
         return pred_masks
+
+    def batch_inference(self, images, image_prompts, threshold=0.5):
+        """
+        Runs batched inference on multiple images with specified prompt lists.
+        
+        Args:
+            images: list of PIL Images or numpy arrays (length B)
+            image_prompts: list of lists of strings (length B)
+            threshold: confidence threshold
+            
+        Returns:
+            list of dicts: length B list containing predicted binary masks mapped by prompt string
+        """
+        if self.baseline:
+            return self.clipseg.batch_inference(images, image_prompts, threshold=threshold)
+            
+        results = []
+        for img, prompts in zip(images, image_prompts):
+            if not prompts:
+                results.append({})
+                continue
+                
+            if isinstance(img, np.ndarray):
+                image_pil = Image.fromarray(img)
+            else:
+                image_pil = img
+                
+            img_bgr = np.array(image_pil.convert("RGB"))[:, :, ::-1]
+            
+            predictions, _ = self.demo.run_on_image(img_bgr, prompts)
+            sem_seg = predictions["sem_seg"]  # Tensor shape [C, H, W] containing logits
+            
+            if not torch.is_tensor(sem_seg):
+                sem_seg = torch.as_tensor(np.asarray(sem_seg))
+                
+            probs = sem_seg.softmax(0)
+            probs_np = probs.cpu().numpy()
+            
+            img_res = {}
+            for idx, prompt in enumerate(prompts):
+                img_res[prompt] = (probs_np[idx] > threshold).astype(np.uint8)
+                
+            results.append(img_res)
+            
+        return results
