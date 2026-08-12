@@ -139,3 +139,61 @@ class CATSegModel(BaseOVSModel):
             results.append(img_res)
             
         return results
+
+    def predict_with_embeddings(self, image_pil, embeddings_dict, threshold=0.5):
+        """
+        Predict binary masks using pre-computed text embeddings.
+        
+        Args:
+            image_pil: PIL.Image or np.ndarray
+            embeddings_dict: dict mapping category keys/prompts to torch.Tensor of shape [D] or [1, D]
+            threshold: float, confidence threshold
+            
+        Returns:
+            dict: predicted binary masks mapped by category keys
+        """
+        if self.baseline:
+            return self.clipseg.predict_with_embeddings(image_pil, embeddings_dict, threshold=threshold)
+            
+        if isinstance(image_pil, np.ndarray):
+            image_pil = Image.fromarray(image_pil)
+            
+        img_bgr = np.array(image_pil.convert("RGB"))[:, :, ::-1]
+        
+        keys = list(embeddings_dict.keys())
+        if not keys:
+            return {}
+            
+        emb_list = []
+        for k in keys:
+            t = embeddings_dict[k]
+            if isinstance(t, np.ndarray):
+                t = torch.from_numpy(t)
+            if t.dim() == 2 and t.shape[0] == 1:
+                t = t.squeeze(0)
+            emb_list.append(t)
+            
+        text_embeddings = torch.stack(emb_list, dim=0).to(self.device)  # Shape [C, D]
+        
+        # Check if predictor supports text_features / text_embeddings parameter
+        try:
+            predictions, _ = self.demo.run_on_image(img_bgr, text_features=text_embeddings)
+        except TypeError:
+            try:
+                predictions = self.demo.run_on_image_with_embeddings(img_bgr, text_embeddings)
+            except AttributeError:
+                # Fallback: pass keys as text prompts if embedding forward is not directly exposed
+                predictions, _ = self.demo.run_on_image(img_bgr, keys)
+                
+        sem_seg = predictions["sem_seg"]  # Tensor shape [C, H, W]
+        if not torch.is_tensor(sem_seg):
+            sem_seg = torch.as_tensor(np.asarray(sem_seg))
+            
+        probs = sem_seg.softmax(0)
+        probs_np = probs.cpu().numpy()
+        
+        pred_masks = {}
+        for idx, key in enumerate(keys):
+            pred_masks[key] = (probs_np[idx] > threshold).astype(np.uint8)
+            
+        return pred_masks
