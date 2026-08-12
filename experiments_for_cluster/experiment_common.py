@@ -128,7 +128,10 @@ BUILDERS = {
 }
 
 
-def run_segmentation_batch(image, cond_embeddings, threshold=0.5):
+SEGMENTATION_CHUNK_SIZE = 16  # cap peak memory: each item duplicates the full-res image in the batch
+
+
+def _run_segmentation_probs_chunk(image, cond_embeddings):
     processor, model = bm_hp.load_model()
     device = bm_hp.get_device()
     w, h = image.size
@@ -143,7 +146,26 @@ def run_segmentation_batch(image, cond_embeddings, threshold=0.5):
     probs = torch.nn.functional.interpolate(
         probs.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False
     )[:, 0]
-    return (probs.cpu().numpy() > threshold).astype(np.uint8)
+    return probs.cpu().numpy()
+
+
+def run_segmentation_probs_batch(image, cond_embeddings, chunk_size=SEGMENTATION_CHUNK_SIZE):
+    """Runs CLIPSeg over `cond_embeddings` in memory-bounded chunks (each chunk duplicates the
+    full-res image `len(chunk)` times, so large K -- e.g. WaffleCLIP's 30+ descriptors times up
+    to 4 linguistic variants -- can otherwise blow up peak memory). Chunking is purely a memory
+    optimization: results are numerically identical to running everything in one batch, since
+    each embedding's forward pass is independent."""
+    if len(cond_embeddings) <= chunk_size:
+        return _run_segmentation_probs_chunk(image, cond_embeddings)
+    chunks = [
+        _run_segmentation_probs_chunk(image, cond_embeddings[i:i + chunk_size])
+        for i in range(0, len(cond_embeddings), chunk_size)
+    ]
+    return np.concatenate(chunks, axis=0)
+
+
+def run_segmentation_batch(image, cond_embeddings, threshold=0.5):
+    return (run_segmentation_probs_batch(image, cond_embeddings) > threshold).astype(np.uint8)
 
 
 def get_variants(cat_name, synset):
@@ -279,6 +301,78 @@ def run_query_transform_experiment(out_path, method_name, transform_fn, limit_ca
                             "dataset": dataset_name, "category": cat_name, "variant": vname,
                             "variant_word": word, "img_ref": str(img_ref), "method": method,
                             "iou": bm_hp.compute_iou(masks[i], gt),
+                        })
+                    seen.add(key)
+                    f.flush()
+                print(f"  {cat_name}: done ({len(img_refs)} images)")
+    finally:
+        f.close()
+
+
+def run_multi_descriptor_experiment(out_path, method_name, baseline_descriptors_fn, method_descriptors_fn,
+                                     limit_categories=None, limit_images=None, threshold=0.5):
+    """Score-level ensembling across independently-embedded descriptor sentences.
+
+    Mirrors the *default* aggregation path in the official WaffleCLIP (`base_main.py`,
+    `--merge_predictions` unset) and classify_by_description (`load.py: aggregate_similarity`,
+    `aggregation_method='mean'`) repos: each descriptor is embedded and scored on its own, and
+    the resulting *scores* are averaged -- not the text embeddings. CLIPSeg has no separate
+    image-text cosine score to average (the conditional embedding drives the decoder directly),
+    so the segmentation-domain analog used here is to run one CLIPSeg forward pass per descriptor
+    and mean-average the resulting sigmoid probability maps before thresholding.
+    """
+    fieldnames = ["dataset", "category", "variant", "variant_word", "img_ref", "method", "iou"]
+    f, writer, seen = resumable_writer(out_path, fieldnames, ["dataset", "category", "img_ref"])
+    try:
+        for dataset_name, builder in BUILDERS.items():
+            ctx, positive_set = builder()
+            categories = [c for c in sorted(positive_set) if eligible_synset(c) is not None]
+            if limit_categories:
+                categories = categories[:limit_categories]
+            print(f"{dataset_name}: {len(categories)} categories")
+
+            for cat_name in categories:
+                synset = eligible_synset(cat_name)
+                variants, _ = get_variants(cat_name, synset)
+                query_info = {}
+                for vname, word in variants.items():
+                    baseline_sents = baseline_descriptors_fn(word)
+                    method_sents = method_descriptors_fn(word)
+                    baseline_embs = [bm_hp.get_text_embedding_cached(s) for s in baseline_sents]
+                    method_embs = [bm_hp.get_text_embedding_cached(s) for s in method_sents]
+                    query_info[vname] = (word, baseline_embs, method_embs)
+
+                img_refs = positive_set[cat_name]
+                if limit_images:
+                    img_refs = img_refs[:limit_images]
+
+                for img_ref in img_refs:
+                    key = (dataset_name, cat_name, str(img_ref))
+                    if key in seen:
+                        continue
+                    try:
+                        image, gt = FETCHERS[dataset_name](ctx, cat_name, img_ref)
+                    except Exception as e:
+                        print(f"  skip {dataset_name}/{cat_name}/{img_ref}: {e}")
+                        continue
+                    if image is None or gt is None or gt.sum() == 0:
+                        continue
+
+                    all_embs, groups = [], []
+                    for vname, (word, baseline_embs, method_embs) in query_info.items():
+                        groups.append((vname, word, "baseline", len(all_embs), len(baseline_embs)))
+                        all_embs.extend(baseline_embs)
+                        groups.append((vname, word, method_name, len(all_embs), len(method_embs)))
+                        all_embs.extend(method_embs)
+
+                    probs = run_segmentation_probs_batch(image, all_embs)
+                    for vname, word, method, start, count in groups:
+                        avg_prob = probs[start:start + count].mean(axis=0)
+                        mask = (avg_prob > threshold).astype(np.uint8)
+                        writer.writerow({
+                            "dataset": dataset_name, "category": cat_name, "variant": vname,
+                            "variant_word": word, "img_ref": str(img_ref), "method": method,
+                            "iou": bm_hp.compute_iou(mask, gt),
                         })
                     seen.add(key)
                     f.flush()
