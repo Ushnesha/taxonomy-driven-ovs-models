@@ -1,0 +1,16 @@
+torch>=2.0.0
+transformers>=4.30.0
+pycocotools>=2.0.7
+pillow>=8.0.0
+requests>=2.25.0
+nltk>=3.5
+numpy>=1.18.0,<2
+
+# needed by expanded_benchmark_helpers.py (loaders for ADE20K/PascalVOC images,
+# BabelNet-fallback disambiguation, and a top-level IPython import it requires
+# to load at all)
+datasets>=2.0.0
+sentence-transformers
+sentencepiece>=0.1.90
+protobuf>=3.20.3
+ipython
