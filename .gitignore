@@ -22,3 +22,5 @@ logs/
 
 datasets/
 data/
+
+.DS_Store
