@@ -22,6 +22,21 @@ class CLIPSegModel(BaseOVSModel):
             "width": self.model.config.vision_config.image_size
         }
 
+    def get_text_embedding(self, word, desc=False):
+        """
+        Raw (NOT L2-normalized) conditional text embedding -- the blending
+        hook. Shape [1, 512]. CLIPSeg's FiLM decoder was trained on these raw-
+        norm vectors (norm ~9-10); unit-normalizing changes decoder behavior,
+        so this must stay unnormalized all the way through any blending.
+        """
+        prompt = word if desc else f"a photo of a {word}"
+        inputs = self.processor(text=[prompt], return_tensors="pt", padding=True).to(self.device)
+        with torch.inference_mode():
+            text_features = self.model.clip.get_text_features(**inputs)
+            if hasattr(text_features, "pooler_output"):
+                text_features = text_features.pooler_output
+        return text_features.cpu()
+
     def predict(self, image, text_cats, coco, threshold=0.5, desc=False):
         if isinstance(image, np.ndarray):
             image_pil = Image.fromarray(image)

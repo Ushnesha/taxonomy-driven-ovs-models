@@ -7,6 +7,7 @@ from ovs_eval.models.san import SANModel
 from ovs_eval.models.sam_clip import SAMCLIPModel
 from ovs_eval.models.grounded_sam import GroundedSAMModel
 from ovs_eval.models.sam_siglip import SAMSiglipModel
+from ovs_eval.models.groupvit import GroupViTOVSModel
 
 _REGISTRY = {
     "clipseg": CLIPSegModel,
@@ -18,7 +19,18 @@ _REGISTRY = {
     "sam_clip": SAMCLIPModel,
     "grounded_sam": GroundedSAMModel,
     "sam_siglip": SAMSiglipModel,
+    "groupvit": GroupViTOVSModel,
 }
+
+# SClip needs mmengine/mmcv/mmsegmentation, which live in their own venv
+# (models_sandbox/sclip_venv) separate from this project's base
+# requirements.txt -- import it lazily so importing this registry doesn't
+# fail in a venv that never installed those deps.
+try:
+    from ovs_eval.models.sclip import SClipModel
+    _REGISTRY["sclip"] = SClipModel
+except ImportError as _sclip_import_error:
+    SClipModel = None
 
 def list_models():
     return list(_REGISTRY.keys())
