@@ -1,0 +1,35 @@
+# experiments_for_cluster/ scripts import from the repo root
+# (expanded_benchmark_helpers.py, ovs_eval/models/*.py) so this is NOT a
+# self-contained/portable venv like ../for_execution/ -- it needs the full
+# taxonomy-driven-ovs-models/ checkout on PYTHONPATH (models.py and
+# approaches.py both insert REPO_ROOT at import time) plus the sibling
+# ../../benchmark/ and ../../models_reference/ directories from
+# openVocabSegmentation/.
+#
+# Covers: clipseg, groupvit (both pure HF Transformers checkpoints). SCLIP
+# needs a SEPARATE venv (mmcv/mmengine/mmsegmentation) -- see
+# ../../models_reference/sclip/setup_env.sh -- do not add those heavy,
+# separately-pinned deps here.
+
+torch>=2.0.0
+transformers>=4.30.0
+pillow>=8.0.0
+numpy>=1.18.0
+requests>=2.25.0
+nltk>=3.5
+
+# HF datasets loader, needed for ADE20K/Pascal VOC images
+# (expanded_benchmark_helpers.load_ade20k / load_pascalvoc).
+datasets>=2.0.0
+
+# expanded_benchmark_helpers.py loads a SentenceTransformer at import time
+# (used by the benchmark-builder's context-aware disambiguation, not by
+# anything in this folder directly, but the import happens either way).
+sentence-transformers
+sentencepiece>=0.1.90
+protobuf>=3.20.3
+
+# expanded_benchmark_helpers.py has a top-level `from IPython.core import
+# async_helpers` import (unused in this folder's code path but required for
+# the module to import at all).
+ipython
