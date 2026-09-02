@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+results/
+coco_data/
+venv/
+sclip_venv/
+*.egg-info/
