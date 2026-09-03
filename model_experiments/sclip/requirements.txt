@@ -1,0 +1,26 @@
+numpy<2
+setuptools<81
+wheel
+torch==2.1.2
+torchvision==0.16.2
+openmim
+mmengine==0.10.7
+mmcv==2.0.1
+mmsegmentation==1.1.1
+ftfy
+regex
+yapf==0.40.1
+pycocotools
+requests
+nltk
+transformers==4.40.0
+Pillow
+
+# needed by expanded_benchmark_helpers.py (loaders for ADE20K/PascalVOC images,
+# BabelNet-fallback disambiguation, and a top-level IPython import it requires
+# to load at all) -- versions matched to the transformers==4.40.0/torch==2.1.2
+# pins above, per setup_env.sh
+sentence-transformers==2.7.0
+datasets
+sentencepiece
+ipython
