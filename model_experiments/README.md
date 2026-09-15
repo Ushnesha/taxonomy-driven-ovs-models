@@ -6,8 +6,9 @@ waffleclip/llm_descriptor comparison on the real benchmark (positive-set IoU and
 negative-set false-positive rate). Each folder can be `cd`-ed into and run with its own
 venv, with nothing else from this repo checked out -- deliberately, so running one model's
 experiments never requires setting up (or risks breaking) another's environment, and each
-folder can be zipped/rsynced to the cluster independently. SCLIP in particular needs heavy,
-version-pinned deps (mmengine/mmcv/mmsegmentation) that clipseg/groupvit don't.
+folder can be zipped/rsynced to the cluster independently. SCLIP needs heavy, version-pinned
+deps (mmengine/mmcv/mmsegmentation) that clipseg/groupvit don't; CAT-Seg needs detectron2
+(built from source) and a real checkpoint.
 
 ## Layout
 
@@ -15,15 +16,22 @@ version-pinned deps (mmengine/mmcv/mmsegmentation) that clipseg/groupvit don't.
 clipseg/
 groupvit/
 sclip/
+catseg/
   requirements.txt              pip-installable deps for this model only
-  setup_env.sh                  sclip/ only -- builds its venv via mim (mmcv needs this,
-                                 not plain pip) and vendors the SCLIP repo
+  setup_env.sh                  sclip/, catseg/ only -- sclip builds its venv via mim
+                                 (mmcv needs this, not plain pip) and vendors the SCLIP
+                                 repo; catseg builds detectron2 from source and vendors
+                                 the CAT-Seg repo
   base.py                       BaseOVSModel interface
-  clipseg.py / groupvit.py / sclip.py   model wrapper (get_text_embedding / predict_with_embeddings)
+  clipseg.py / groupvit.py / sclip.py / catseg.py   model wrapper (get_text_embedding /
+                                 predict_with_embeddings) -- catseg.py also carries a
+                                 CLIPSeg-fallback baseline mode, see its module docstring
   SCLIP/                        sclip/ only -- vendored, code-only copy of
                                  https://github.com/wangf3014/SCLIP (ECCV 2024), used
                                  directly per its own license; proper citation/
                                  contribution reference to be added later
+  CAT-Seg/                      catseg/ only -- vendored (via setup_env.sh) copy of
+                                 https://github.com/KU-CVLAB/CAT-Seg (CVPR 2024)
   expanded_benchmark_helpers.py   dataset loaders, WordNet/embedding utilities
   benchmark_data.py             loads ../../../benchmark/ (LVIS/ADE20K/PascalVOC),
                                  GT mask resolution incl. shared-hypernym mask merging
@@ -35,6 +43,11 @@ sclip/
   negative_set_experiment.py    false-positive rate, all 5 approaches, on the negative set
 ```
 
+**catseg/ has not been run end-to-end** (no local CUDA/detectron2) -- see
+`catseg/README.md` before trusting any of its output. Its 3 orchestration scripts also
+refuse to run at full scale without `--config`/`--weights`, unlike the other three models
+(see that README's "Full-scale run safety gate").
+
 `expanded_benchmark_helpers.py` / `benchmark_data.py` / `approaches.py` are point-in-time
 copies of `../experiments_for_cluster/{expanded_benchmark_helpers,benchmark_data,
 approaches}.py` (that directory is the source of truth / "common library" these are copied
@@ -44,9 +57,9 @@ the corresponding wrapper in `../ovs_eval/models/`.
 ## Running
 
 ```bash
-cd clipseg   # or groupvit, or sclip
+cd clipseg   # or groupvit, sclip, catseg
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt          # sclip/ instead: bash setup_env.sh
+pip install -r requirements.txt          # sclip/, catseg/ instead: bash setup_env.sh
 
 # 1. derive this model's alpha on COCO, full scale
 python3 alpha_value_experiment.py --coco-dir ./coco_data
