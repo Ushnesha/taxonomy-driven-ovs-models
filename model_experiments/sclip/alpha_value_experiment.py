@@ -555,6 +555,9 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default="./results")
     args = parser.parse_args()
 
+    from provenance import RunMeta, count_csv_rows
+    meta = RunMeta(args.out_dir, args, __file__)
+
     coco_dir = os.path.abspath(args.coco_dir)
     os.makedirs(coco_dir, exist_ok=True)
     ann_path = ensure_coco_annotations(coco_dir)
@@ -578,3 +581,5 @@ if __name__ == "__main__":
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
 
     summarize(detail_out, summary_out)
+    meta.finish(detail_csv=detail_out, summary_csv=summary_out,
+                n_detail_rows=count_csv_rows(detail_out))
