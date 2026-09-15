@@ -1,15 +1,15 @@
 """
-Loads and serves the precomputed benchmark at ../../benchmark/ (sibling of
-this repo, built by expanding LVIS + ADE20K + Pascal VOC -- no COCO): 346
+Loads and serves the precomputed benchmark at ../../../benchmark/ (sibling of
+taxonomy-driven-ovs-models/, built by expanding LVIS + ADE20K + Pascal VOC -- no COCO): 346
 canonical categories, 22,357 images, positive/negative image sets and
 one-level WordNet synonym/hyponym/hypernym sets per category.
 
-This replaces experiment_common.py's BUILDERS, which instead re-derived
-positive/negative sets and word variants live from the raw datasets on every
-run. Every orchestration script (positive_set_experiment.py,
-negative_set_experiment.py, and later ablations) shares this module for:
-loading the 4 benchmark files, resolving (dataset, img_ref) -> (PIL image,
-GT mask), and building each category's {orig, syn, hypo, hyper} variant words.
+Local copy for this standalone model folder (see ../README.md) -- source of
+truth is ../../experiments_for_cluster/benchmark_data.py, kept in sync
+manually. Used here by positive_set_experiment.py / negative_set_experiment.py
+for: loading the 4 benchmark files, resolving (dataset, img_ref) -> (PIL
+image, GT mask), and building each category's {orig, syn, hypo, hyper}
+variant words.
 
 Known caveat (deliberately out of scope here, see conversation decision log):
 word_sets_v2.json has real WordNet-sense disambiguation errors for some
@@ -21,7 +21,6 @@ import csv
 import json
 import os
 import pickle
-import sys
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -32,15 +31,14 @@ import requests
 from PIL import Image
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(THIS_DIR)
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
-import expanded_benchmark_helpers as bm_hp  # noqa: E402
+import expanded_benchmark_helpers as bm_hp  # noqa: E402  (local copy, sibling file)
 from expanded_benchmark_helpers import to_display_form  # noqa: E402
 
+# THIS_DIR/../../../benchmark: model_experiments/<model>/ -> model_experiments/ ->
+# taxonomy-driven-ovs-models/ -> openVocabSegmentation/benchmark/
 DEFAULT_BENCHMARK_DIR = os.environ.get(
-    "BENCHMARK_DIR", os.path.normpath(os.path.join(REPO_ROOT, "..", "benchmark"))
+    "BENCHMARK_DIR", os.path.normpath(os.path.join(THIS_DIR, "..", "..", "..", "benchmark"))
 )
 
 

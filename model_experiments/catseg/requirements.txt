@@ -1,0 +1,38 @@
+# NOTE: this file alone is NOT enough for production mode -- detectron2 needs to be built
+# from source (git install, no prebuilt wheel), and CAT-Seg itself needs to be vendored
+# under ./CAT-Seg. Run setup_env.sh instead, which does `pip install -r requirements.txt`
+# for these pins plus the detectron2/CAT-Seg steps. This file is useful on its own only for
+# baseline mode (CLIPSeg fallback -- see catseg.py's module docstring), e.g. a quick
+# `pip install -r requirements.txt` to smoke-test this folder's pipeline without a GPU.
+
+torch>=1.13.0
+torchvision
+
+# CAT-Seg's own pins (KU-CVLAB/CAT-Seg requirements.txt, as of this writing) -- kept exact
+# since detectron2/CAT-Seg's own code was written and tested against these.
+scipy==1.7.0
+ftfy==6.0.1
+opencv-python==4.5.1.48
+setuptools==59.5.0
+pillow==8.2.0
+imageio==2.4.1
+timm==0.8.3.dev0
+regex
+einops
+open_clip_torch
+
+# baseline-mode fallback (clipseg.py) + this folder's own pipeline deps
+transformers>=4.30.0
+pycocotools>=2.0.7
+requests>=2.25.0
+nltk>=3.5
+numpy>=1.18.0,<2
+
+# needed by expanded_benchmark_helpers.py (loaders for ADE20K/PascalVOC images,
+# BabelNet-fallback disambiguation, and a top-level IPython import it requires
+# to load at all)
+datasets>=2.0.0
+sentence-transformers
+sentencepiece>=0.1.90
+protobuf>=3.20.3
+ipython

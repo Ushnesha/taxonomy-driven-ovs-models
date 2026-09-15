@@ -305,6 +305,23 @@ def build_sclip_name_path(bm, out_path):
     return out_path
 
 
+def build_catseg_class_json(bm, out_path):
+    """Writes a CAT-Seg-format TEST_CLASS_JSON (a plain JSON list of class-name strings,
+    e.g. ["cat", "dog", ...], in a fixed order) covering every category in `bm`. Analogous
+    to build_sclip_name_path above: CAT-Seg's own joint-softmax head needs a real, full
+    vocabulary at construction time (cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON) before
+    catseg.py's predict_with_embeddings can swap one row of it per call, exactly like
+    SCLIP's query_features row-swap -- see catseg/catseg.py's module docstring."""
+    names = list(bm.categories)
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(names, f)
+    return out_path
+
+
+
 # =============================================================================
 # Shared checkpointed CSV writer + summary aggregation, used identically by
 # every orchestration script.
