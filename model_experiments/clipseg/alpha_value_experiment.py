@@ -56,7 +56,14 @@ def get_model():
 def get_text_embedding_cached(word: str):
     if word in _embedding_cache:
         return _embedding_cache[word].clone()
-    emb = get_model().get_text_embedding(word, desc=True)
+    # .float(): SCLIP loads OpenAI CLIP in fp16, so its text features come back as
+    # Half. torch.dot has no CPU kernel for Half ("dot" not implemented for 'Half'),
+    # and a Half mean/blend would silently lose precision -- worse, the weighted
+    # centroid promotes to fp32 (its weights are fp32) while the unweighted one stays
+    # Half, making the two paths numerically incomparable. Do every blend in fp32;
+    # sclip._predict_joint casts back to the model dtype on assignment, and CLIPSeg/
+    # GroupViT are fp32 already so this is a no-op there.
+    emb = get_model().get_text_embedding(word, desc=True).float()
     _embedding_cache[word] = emb.cpu()
     return emb
 
@@ -170,7 +177,7 @@ def eligible_synset(word):
 
 
 def cosine_sim(a, b):
-    a, b = a.squeeze(), b.squeeze()
+    a, b = a.squeeze().float(), b.squeeze().float()   # .float(): see get_text_embedding_cached
     return (a @ b).item() / (a.norm().item() * b.norm().item())
 
 
@@ -561,6 +568,9 @@ if __name__ == "__main__":
     if args.grid in ("coarse", "both"):
         run_grid("coarse", ALPHA_GRID_COARSE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
+    summarize(detail_out, summary_out)   # so a "both" run that dies in
+                                          # the fine grid still leaves a
+                                          # usable coarse summary
     if args.grid in ("fine", "both"):
         run_grid("fine", ALPHA_GRID_FINE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)

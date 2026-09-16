@@ -62,7 +62,10 @@ def embed(model, word, desc=True):
     """
     key = (id(model), word, desc)
     if key not in _embed_cache:
-        _embed_cache[key] = model.get_text_embedding(word, desc=desc).cpu()
+        # .float(): SCLIP loads OpenAI CLIP in fp16 and torch.dot has no CPU kernel for
+        # Half, so cosine_sim's `a @ b` raises. Casting here also keeps the weighted and
+        # unweighted centroids at the same precision -- see the model_experiments copies.
+        _embed_cache[key] = model.get_text_embedding(word, desc=desc).cpu().float()
     return _embed_cache[key].clone()
 
 
