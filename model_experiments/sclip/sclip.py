@@ -48,6 +48,82 @@ from PIL import Image
 from base import BaseOVSModel
 
 
+def _patch_postprocess_class_merge(clip_segmentor):
+    """
+    Replace CLIPForSegmentation.postprocess_result's class-merge step with a
+    mathematically identical but vastly smaller one.
+
+    SCLIP maps `num_queries` prompts onto `num_cls` classes (113 -> 81 for
+    cls_coco_object.txt: several classes have multiple names). Upstream merges
+    them by broadcasting a one-hot matrix over the full logit map:
+
+        cls_index  = one_hot(query_idx).T.view(num_cls, num_queries, 1, 1)
+        seg_logits = (seg_logits * cls_index).max(1)[0]
+
+    That materialises a (num_cls x num_queries x H x W) tensor -- 9,153 copies
+    of the image -- before immediately reducing it away along dim 1. seg_logits
+    is at the ORIGINAL image resolution (predict() upsamples to ori_shape), so
+    the cost scales with the input image, not with the 336px network input:
+    fine on 640x480 COCO, fatal on the benchmark's large LVIS/ADE20K images
+    (observed: a 2962 GiB allocation request on an 80 GiB A100).
+
+    The reduction is a segmented max -- for each class, the max over the queries
+    belonging to it -- so it can be done straight into a (num_cls x H x W)
+    buffer, using ~num_queries times less memory. Equivalence: post-softmax
+    logits are non-negative, so the zeros the one-hot mask introduces for
+    non-member queries never beat a real member value; classes with no queries
+    stay 0 under both forms.
+    """
+    cls = clip_segmentor.CLIPForSegmentation
+    if getattr(cls, "_ovs_lowmem_merge", False):
+        return
+
+    def _merge(logits, query_idx, num_cls):
+        """logits [num_queries, H, W] -> [num_cls, H, W], per-class max."""
+        idx = query_idx.to(logits.device)
+        out = logits.new_zeros((num_cls,) + tuple(logits.shape[1:]))
+        try:
+            return out.index_reduce_(0, idx, logits, "amax", include_self=False)
+        except (RuntimeError, AttributeError):
+            # index_reduce_ is missing on old torch and can lack a kernel for
+            # some dtypes; the per-class loop is slower but always available and
+            # still never allocates more than one class's worth of rows.
+            for c in range(num_cls):
+                rows = (idx == c).nonzero(as_tuple=True)[0]
+                if rows.numel():
+                    out[c] = logits.index_select(0, rows).amax(0)
+            return out
+
+    def postprocess_result(self, seg_logits, data_samples):
+        batch_size = seg_logits.shape[0]
+        for i in range(batch_size):
+            logits = seg_logits[i] * self.logit_scale
+            logits = logits.softmax(0)  # num_queries * H * W
+
+            num_cls, num_queries = max(self.query_idx) + 1, len(self.query_idx)
+            if num_cls != num_queries:
+                logits = _merge(logits, self.query_idx, num_cls)
+
+            if self.area_thd is not None:
+                predictions = torch.nn.functional.one_hot(
+                    logits.argmax(0), num_cls).to(logits.dtype)
+                area_pred = predictions[:, :, 1:].sum((0, 1), keepdim=True)
+                area_pred = (area_pred > self.area_thd * area_pred.sum()).to(logits.dtype)
+                logits[1:] *= area_pred.transpose(0, -1)
+
+            seg_pred = logits.argmax(0, keepdim=True)
+            seg_pred[logits.max(0, keepdim=True)[0] < self.prob_thd] = 0
+
+            data_samples[i].set_data({
+                "seg_logits": clip_segmentor.PixelData(**{"data": logits}),
+                "pred_sem_seg": clip_segmentor.PixelData(**{"data": seg_pred}),
+            })
+        return data_samples
+
+    cls.postprocess_result = postprocess_result
+    cls._ovs_lowmem_merge = True
+
+
 def _patch_mmcv_ops():
     """
     mmcv's compiled `mmcv.ops` extension is not needed by CLIPForSegmentation
@@ -110,6 +186,8 @@ class SClipModel(BaseOVSModel):
                 "https://github.com/wangf3014/SCLIP."
             ) from e
 
+        _patch_postprocess_class_merge(clip_segmentor)
+
         self._clip_segmentor = clip_segmentor
         self._clip_module = sclip_clip
         self._template_list = openai_imagenet_template
@@ -167,11 +245,16 @@ class SClipModel(BaseOVSModel):
         template-free, as the single query.
         """
         with torch.no_grad():
+            # truncate=True: OpenAI CLIP's tokenize() defaults to truncate=False, which
+            # RAISES on anything over the 77-token context length. SHiNe's
+            # "a X, which is a Y, which is a Z, ..." sentences, built from WordNet
+            # hypernym paths, routinely exceed it. The class name comes first, so
+            # truncation drops only the most abstract tail ancestors.
             if desc:
-                query = self._clip_module.tokenize([word]).to(self.device)
+                query = self._clip_module.tokenize([word], truncate=True).to(self.device)
             else:
                 query = self._clip_module.tokenize(
-                    [t(word) for t in self._template_list]
+                    [t(word) for t in self._template_list], truncate=True
                 ).to(self.device)
             feature = self.model.net.encode_text(query)
             feature = feature / feature.norm(dim=-1, keepdim=True)

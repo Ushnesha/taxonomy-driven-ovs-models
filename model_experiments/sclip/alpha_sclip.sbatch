@@ -5,6 +5,9 @@
 #
 #   sbatch alpha_sclip.sbatch both        # coarse then fine, one job (default)
 #
+#   # guarded dry run -- all 37 categories, 2 images each, ~15 min:
+#   sbatch --time=0-01:00:00 alpha_sclip.sbatch coarse /tmp/sclip_thdfix 2
+#
 # Or split them, passing stage 1's OUT dir to stage 2 so it appends:
 #   sbatch alpha_sclip.sbatch coarse
 #   sbatch alpha_sclip.sbatch fine /home/sschaud5/workspace/OVS/results/alpha_sclip_20260910_2200
@@ -28,7 +31,9 @@
 
 set -euo pipefail
 
-GRID=${1:-both}                            # coarse | fine | both
+GRID=${1:-both}                            # arg1: coarse | fine | both
+N_IMAGES=${3:-350}                         # arg3: images per category (use a small
+                                           #       value for a guarded dry run)
 REPO=$HOME/workspace/OVS/taxonomy-driven-ovs-models
 EXPDIR=$REPO/model_experiments/sclip
 PY=$EXPDIR/sclip_venv/bin/python             # SCLIP's OWN venv -- NOT the tasa conda env
@@ -51,6 +56,7 @@ echo "=================================================="
 echo "node   = $SLURMD_NODENAME"
 echo "job    = $SLURM_JOB_ID"
 echo "grid   = $GRID"
+echo "n-imgs = $N_IMAGES"
 echo "OUT    = $OUT"
 echo "  (pass this OUT as arg 2 for the next stage)"
 echo "=================================================="
@@ -88,7 +94,7 @@ $PY alpha_value_experiment.py \
     --coco-dir "$COCO_DIR" \
     --grid "$GRID" \
     --n-categories -1 \
-    --n-images 350 \
+    --n-images "$N_IMAGES" \
     --out-dir "$OUT"
 
 echo "DONE ($GRID) -> $OUT"

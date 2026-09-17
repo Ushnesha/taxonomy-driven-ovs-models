@@ -20,21 +20,35 @@ Usage:
 """
 import argparse
 import os
+import random
 
 import benchmark_data as bd
 import approaches as ap
 from sclip import SClipModel
 
+# SCLIP's prob_thd is a floor on the JOINT softmax over every benchmark class, not a
+# per-prompt binary sigmoid like CLIPSeg's. Its published config uses 0.1; CLIPSeg's 0.5
+# demands one class hold >50% of the softmax mass, which silently zeroes most categories
+# (it cut mean orig IoU from ~0.34 to ~0.12 in the COCO alpha sweep).
+THRESHOLD = 0.1
+
+SAMPLE_SEED = 42  # --limit-images takes a SEEDED RANDOM sample, not the first N: the
+                  # benchmark JSON's image order is not random, so img_ids[:N] biases the
+                  # subset. Seeded per (seed, category) so it is reproducible and each
+                  # category's draw is independent of the others.
+
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 FIELDNAMES = ["category", "variant", "variant_word", "img_id", "approach", "iou"]
 
 
-def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=0.5):
+def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=None):
     """SCLIP's predict_with_embeddings() only accepts one embedding per call, keyed by a
     real class name (its joint-softmax interface swaps one query_features row in per
     call), unlike CLIPSeg/GroupViT's arbitrary-tag batching. So this issues one call per
     tag, all keyed by `cat_name` (the actual class every tag's embedding is a
     variant/approach computed for), re-keying the single-entry result back onto the tag."""
+    if threshold is None:
+        threshold = THRESHOLD
     masks = {}
     for tag, emb in tag_to_embedding.items():
         result = model.predict_with_embeddings(image, {cat_name: emb}, threshold=threshold)
@@ -42,8 +56,8 @@ def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=0
     return masks
 
 
-def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_images=None, device=None):
-    bm = bd.load_benchmark(benchmark_dir)
+def run(alpha, weighted, out_path, benchmark_dir, exclude_sources=(), limit_categories=None, limit_images=None, device=None, sample_seed=SAMPLE_SEED):
+    bm = bd.load_benchmark(benchmark_dir, exclude_sources=exclude_sources)
 
     # SCLIP's default class list only covers COCO's 80 classes; our 346-category
     # benchmark needs its own class-list config so predict_with_embeddings() can resolve
@@ -59,13 +73,15 @@ def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_i
         categories = categories[:limit_categories]
     print(f"{len(categories)} eligible categories, approaches={ap.ALL_APPROACHES}")
 
+    unresolved_counts = {}  # {(approaches that returned None,): times it happened}
     f, writer, seen = bd.resumable_csv_writer(out_path, FIELDNAMES, ["category", "img_id"])
     try:
         for cat_name in categories:
             variants = bd.get_variants(cat_name, bm.word_sets)
             img_ids = bm.positive_set.get(cat_name, [])
-            if limit_images:
-                img_ids = img_ids[:limit_images]
+            if limit_images and len(img_ids) > limit_images:
+                img_ids = sorted(random.Random(f"{sample_seed}:{cat_name}").sample(
+                    img_ids, limit_images))
 
             for img_id in img_ids:
                 key = (cat_name, str(img_id))
@@ -92,14 +108,26 @@ def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_i
                     gt = bd.decode_gt_mask_for_variant(bm, entry, cat_name, vname)
 
                     tag_to_embedding = {}
+                    unresolved = []
                     for approach in ap.ALL_APPROACHES:
                         emb = ap.approach_embedding(
                             approach, cat_name, word, model,
                             alpha=alpha, weighted=weighted, class_name_list=bm.categories,
                         )
                         if emb is None:
+                            unresolved.append(approach)
                             continue
                         tag_to_embedding[f"{vname}::{approach}"] = emb
+                    if unresolved:
+                        # approach_embedding returns None when the query word has no usable
+                        # WordNet synset -- in practice only "ours" does this. The rows for
+                        # the approaches that DID resolve are real measurements and are
+                        # kept: discarding them would throw away data from four working
+                        # methods. The tally is reported at the end so the coverage gap is
+                        # visible, and analysis restricts to the paired subset when a
+                        # strict 5-way mean comparison is wanted.
+                        k = tuple(unresolved)
+                        unresolved_counts[k] = unresolved_counts.get(k, 0) + 1
                     if not tag_to_embedding:
                         continue
 
@@ -119,6 +147,11 @@ def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_i
             print(f"  {cat_name}: done ({len(img_ids)} images)")
     finally:
         f.close()
+    if unresolved_counts:
+        total = sum(unresolved_counts.values())
+        print(f"[coverage] {total} (category, image, variant) cases where an approach could "
+              f"not resolve an embedding and wrote no row (other approaches still scored): "
+              + ", ".join(f"{'+'.join(k)}={v}" for k, v in sorted(unresolved_counts.items())))
     print(f"detail written to {out_path}")
 
 
@@ -132,14 +165,31 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     parser.add_argument("--limit-categories", type=int, default=None)
     parser.add_argument("--limit-images", type=int, default=None)
+    parser.add_argument("--threshold", type=float, default=THRESHOLD,
+                         help="SCLIP prob_thd (joint-softmax floor). Default 0.1 = SCLIP's own "
+                              "published value. Do NOT use CLIPSeg's 0.5.")
+    parser.add_argument("--exclude-sources", default="",
+                         help="comma-separated img_src values to drop entirely, e.g. 'ade20k'. "
+                              "Use when a source's HF row indices no longer align with the "
+                              "frozen benchmark. Excluding a WHOLE source is the only safe "
+                              "option -- never filter per-image on a size check.")
+    parser.add_argument("--sample-seed", type=int, default=SAMPLE_SEED,
+                         help="seed for the --limit-images random sample")
     parser.add_argument("--out-dir", default=RESULTS_DIR)
     args = parser.parse_args()
+    THRESHOLD = args.threshold
+
+    from provenance import RunMeta, count_csv_rows
+    meta = RunMeta(args.out_dir, args, __file__)
 
     out_path = os.path.join(args.out_dir, "positive_set_experiment_sclip.csv")
     summary_path = os.path.join(args.out_dir, "positive_set_experiment_sclip_summary.csv")
 
-    run(args.alpha, args.weighted, out_path, args.benchmark_dir,
-        limit_categories=args.limit_categories, limit_images=args.limit_images, device=args.device)
+    exclude_sources = tuple(x.strip() for x in args.exclude_sources.split(",") if x.strip())
+    run(args.alpha, args.weighted, out_path, args.benchmark_dir, exclude_sources=exclude_sources,
+        limit_categories=args.limit_categories, limit_images=args.limit_images, sample_seed=args.sample_seed, device=args.device)
 
     bd.summarize_csv(out_path, ["approach", "variant"], "iou", summary_path)
     print(f"summary written to {summary_path}")
+    meta.finish(detail_csv=out_path, summary_csv=summary_path,
+                n_detail_rows=count_csv_rows(out_path))

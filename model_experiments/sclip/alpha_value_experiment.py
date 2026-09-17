@@ -67,12 +67,38 @@ def get_model():
 def get_text_embedding_cached(word: str):
     if word in _embedding_cache:
         return _embedding_cache[word].clone()
-    emb = get_model().get_text_embedding(word, desc=True)
+    # .float(): SCLIP loads OpenAI CLIP in fp16, so its text features come back as
+    # Half. torch.dot has no CPU kernel for Half ("dot" not implemented for 'Half'),
+    # and a Half mean/blend would silently lose precision -- worse, the weighted
+    # centroid promotes to fp32 (its weights are fp32) while the unweighted one stays
+    # Half, making the two paths numerically incomparable. Do every blend in fp32;
+    # sclip._predict_joint casts back to the model dtype on assignment, and CLIPSeg/
+    # GroupViT are fp32 already so this is a no-op there.
+    # desc=False -> SCLIP's ~80-prompt openai_imagenet_template ensemble, the SAME way
+    # CLIPForSegmentation.__init__ builds every class's query_features (clip_segmentor.py:38).
+    # desc=True would give a bare tokenized word, so the swapped-in class would compete in
+    # SCLIP's joint softmax against 79 classes that DO have ensembled embeddings -- a
+    # handicap that reads as "blending helps enormously" when it is really just recovering
+    # the missing prompt ensemble. desc=True is for SHiNe/WaffleCLIP/LLM-descriptor, which
+    # pass complete sentences that must not be re-templated.
+    # Cost is one-time: embeddings are cached per word, ~400 unique words in the sweep.
+    emb = get_model().get_text_embedding(word, desc=False).float()
     _embedding_cache[word] = emb.cpu()
     return emb
 
 
-def run_segmentation_batch(image, cond_embeddings, cat_name, threshold=0.5):
+# SCLIP's prob_thd is a floor on the JOINT softmax over all 81 classes (80 foreground
+# + the background/stuff line), not a per-prompt binary sigmoid like CLIPSeg's. Its
+# published COCO-Object config (SCLIP/configs/cfg_coco_object.py) uses 0.1; passing
+# CLIPSeg's 0.5 demands that a single class hold >50% of the softmax mass, which almost
+# never happens and silently zeroes every class the model isn't extremely confident
+# about. Set from --threshold in __main__ so the value lands in run_meta.json.
+THRESHOLD = 0.1
+
+
+def run_segmentation_batch(image, cond_embeddings, cat_name, threshold=None):
+    if threshold is None:
+        threshold = THRESHOLD
     """SCLIP's predict_with_embeddings() only accepts one embedding per call, keyed by a
     real class name (its joint-softmax interface swaps one query_features row in per call
     -- see sclip.py's module docstring), unlike CLIPSeg/GroupViT's arbitrary-tag batching.
@@ -185,7 +211,7 @@ def eligible_synset(word):
 
 
 def cosine_sim(a, b):
-    a, b = a.squeeze(), b.squeeze()
+    a, b = a.squeeze().float(), b.squeeze().float()   # .float(): see get_text_embedding_cached
     return (a @ b).item() / (a.norm().item() * b.norm().item())
 
 
@@ -552,8 +578,12 @@ if __name__ == "__main__":
                          help="-1 = every eligible COCO category (the real, intended run)")
     parser.add_argument("--n-images", type=int, default=N_IMAGES,
                          help="-1 = every positive image per category (the real, intended run)")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD,
+                         help="SCLIP prob_thd (joint-softmax floor). Default 0.1 = the value "
+                              "in SCLIP's own cfg_coco_object.py. Do NOT use CLIPSeg's 0.5.")
     parser.add_argument("--out-dir", default="./results")
     args = parser.parse_args()
+    THRESHOLD = args.threshold
 
     from provenance import RunMeta, count_csv_rows
     meta = RunMeta(args.out_dir, args, __file__)
@@ -576,6 +606,9 @@ if __name__ == "__main__":
     if args.grid in ("coarse", "both"):
         run_grid("coarse", ALPHA_GRID_COARSE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
+    summarize(detail_out, summary_out)   # so a "both" run that dies in
+                                          # the fine grid still leaves a
+                                          # usable coarse summary
     if args.grid in ("fine", "both"):
         run_grid("fine", ALPHA_GRID_FINE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
