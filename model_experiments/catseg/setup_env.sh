@@ -11,9 +11,36 @@
 # if different -- see https://pytorch.org/get-started/previous-versions/.
 set -e
 
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
+# ---------------------------------------------------------------------------
+# ASU SOL notes (learned the hard way on the sclip env -- see sclip/setup_env_sol.sh):
+#  * `python3 -m venv` on SOL picks up the SYSTEM python 3.6, and `pip install torch`
+#    then resolves to a max of 1.10.2. Create the interpreter with mamba instead.
+#  * CAT-Seg's own INSTALL.md is tested on Python 3.8; several pins below
+#    (pillow==8.2.0, opencv-python==4.5.1.48) have no wheels for 3.11+ and will try
+#    to build from source. Stick to 3.8.
+#  * `conda activate` frequently no-ops on SOL -- always call the absolute
+#    interpreter path ($ENVDIR/bin/python), never a bare `python`.
+#  * Keep pip's cache off the home quota; 44G of ~/.cache filled it last time.
+# ---------------------------------------------------------------------------
+ENVDIR=${ENVDIR:-$(pwd)/catseg_venv}          # must match PY= in alpha_catseg.sbatch / benchmark_catseg.sbatch
+export PIP_CACHE_DIR=${PIP_CACHE_DIR:-/scratch/$USER/pip_cache}
+mkdir -p "$PIP_CACHE_DIR"
+
+if command -v mamba >/dev/null 2>&1; then
+    echo "creating $ENVDIR with mamba (python 3.8 -- CAT-Seg's tested version)"
+    mamba create -y -p "$ENVDIR" python=3.8
+    # SOL's /lib64/libstdc++.so.6 lacks CXXABI_1.3.15, which conda-installed libs need
+    mamba install -y -p "$ENVDIR" -c conda-forge libstdcxx-ng libgcc-ng
+else
+    echo "mamba not found -- falling back to venv. CHECK the python version below is 3.8+,"
+    echo "otherwise torch will silently resolve to an ancient release."
+    python3 -m venv "$ENVDIR"
+fi
+
+PY="$ENVDIR/bin/python"
+$PY --version
+$PY -m pip install --upgrade pip
+pip() { $PY -m pip "$@"; }      # so every pip below hits THIS env, not mamba base
 
 # Adjust the --index-url / torch version to match your cluster's CUDA (nvidia-smi). This
 # default targets CUDA 11.7, CAT-Seg's own tested combo.
@@ -28,9 +55,19 @@ if [ ! -d "CAT-Seg" ]; then
     git clone https://github.com/KU-CVLAB/CAT-Seg.git
 fi
 
-python3 -c "import nltk; nltk.download('wordnet')"
+# $PY, not python3: the system interpreter would download into the wrong site-packages
+# and leave the env without wordnet. NLTK_DATA keeps the corpus off the home quota.
+export NLTK_DATA=${NLTK_DATA:-$HOME/workspace/OVS/nltk_data}
+mkdir -p "$NLTK_DATA"
+$PY -c "import nltk; nltk.download('wordnet', download_dir='$NLTK_DATA'); nltk.download('omw-1.4', download_dir='$NLTK_DATA')"
 
-echo "done. activate with: source venv/bin/activate"
+echo "done."
+echo "Use the ABSOLUTE interpreter path, not \`conda activate\`:"
+echo "  $ENVDIR/bin/python"
+echo "This is the path alpha_catseg.sbatch / benchmark_catseg.sbatch expect as PY=."
+echo
+echo "Verify:"
+echo "  $ENVDIR/bin/python -c \"import torch,detectron2;print(torch.__version__,torch.cuda.is_available(),detectron2.__version__)\""
 echo
 echo "Next: download a checkpoint from CAT-Seg's model zoo (see CAT-Seg/README.md), e.g."
 echo "  CAT-Seg (L), ViT-L/14@336px: https://huggingface.co/spaces/hamacojr/CAT-Seg-weights/resolve/main/model_large.pth"

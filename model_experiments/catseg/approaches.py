@@ -59,7 +59,14 @@ def embed(model, word, desc=True):
     """
     key = (id(model), word, desc)
     if key not in _embed_cache:
-        _embed_cache[key] = model.get_text_embedding(word, desc=desc).cpu()
+        # .float(): CAT-Seg's CLIP backbone can load in fp16, so text features come
+        # back as Half. torch.dot has no CPU kernel for Half, so cosine_sim's `a @ b`
+        # raises RuntimeError: "dot" not implemented for 'Half'. Casting here (rather
+        # than only in cosine_sim) also keeps the blending math consistent:
+        # compute_weighted_centroid multiplies by fp32 weights and would promote to
+        # fp32, while compute_centroid's plain mean would stay Half -- making the
+        # weighted and unweighted variants of "ours" numerically incomparable.
+        _embed_cache[key] = model.get_text_embedding(word, desc=desc).cpu().float()
     return _embed_cache[key].clone()
 
 

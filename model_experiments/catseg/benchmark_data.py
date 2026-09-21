@@ -52,7 +52,16 @@ class Benchmark:
     hyper_siblings: dict = field(default_factory=dict)  # {category: [category, ...siblings sharing its hyper word]}
 
 
-def load_benchmark(benchmark_dir=None):
+def load_benchmark(benchmark_dir=None, exclude_sources=()):
+    """`exclude_sources`: drop every image from these img_src values (e.g. ("ade20k",))
+    and prune the positive/negative sets accordingly.
+
+    Why this exists: img_metadata.pkl addresses ade20k/pascalvoc images by ROW INDEX into
+    a HuggingFace dataset. If that Hub dataset is re-uploaded or reordered, the indices
+    silently point at DIFFERENT images -- predictions then get scored against another
+    image's ground truth. Excluding the whole source is the only safe response; filtering
+    per-image on a size check is NOT safe, because a wrong image that happens to share the
+    recorded dimensions passes the check and produces plausible, meaningless numbers."""
     benchmark_dir = benchmark_dir or DEFAULT_BENCHMARK_DIR
     with open(os.path.join(benchmark_dir, "word_sets_v2.json")) as f:
         word_sets = json.load(f)
@@ -63,6 +72,15 @@ def load_benchmark(benchmark_dir=None):
     with open(os.path.join(benchmark_dir, "img_metadata.pkl"), "rb") as f:
         img_metadata = pickle.load(f)
     img_by_id = {entry["img_id"]: entry for entry in img_metadata}
+
+    if exclude_sources:
+        exclude_sources = set(exclude_sources)
+        dropped = {i for i, e in img_by_id.items() if e["img_src"] in exclude_sources}
+        img_by_id = {i: e for i, e in img_by_id.items() if i not in dropped}
+        positive_set = {c: [i for i in v if i not in dropped] for c, v in positive_set.items()}
+        negative_set = {c: [i for i in v if i not in dropped] for c, v in negative_set.items()}
+        print(f"[benchmark] excluded sources {sorted(exclude_sources)}: dropped "
+              f"{len(dropped)} images, {len(img_by_id)} remain")
 
     categories = sorted(
         cat for cat in word_sets
@@ -142,6 +160,46 @@ def _pascalvoc_dataset():
     return _PASCALVOC_DS
 
 
+_ADE20K_ROW_BY_FILENAME = None
+
+
+def _ade20k_row_for(entry):
+    """img_metadata.pkl addresses ade20k images by ROW INDEX (img_src_id) into the
+    uva-cv-lab/ade20k-150 HF dataset. That dataset has been re-uploaded/reordered since the
+    benchmark was frozen, so those indices now point at DIFFERENT images -- verified: 15/15
+    sampled entries had mismatched dimensions, while every recorded (h,w) still existed
+    somewhere in the dataset (a reordering, not a different snapshot).
+
+    `filename` (e.g. "ADE_val_00000025.jpg") is present on both sides and is stable, so
+    resolve through that instead. Raises if the filename is absent, which callers already
+    treat as a skip-with-log rather than a crash."""
+    global _ADE20K_ROW_BY_FILENAME
+    if _ADE20K_ROW_BY_FILENAME is None:
+        ds = _ade20k_dataset()
+        # select_columns avoids decoding the image column for all 2000 rows
+        names = ds.select_columns(["filename"])["filename"]
+        _ADE20K_ROW_BY_FILENAME = {n: i for i, n in enumerate(names)}
+    fn = entry.get("filename") or ""
+    row = _ADE20K_ROW_BY_FILENAME.get(fn)
+    if row is None:
+        raise KeyError(f"ade20k filename {fn!r} not found in the current HF dataset "
+                       f"({len(_ADE20K_ROW_BY_FILENAME)} rows)")
+    return row
+
+
+def _verify_dims(img, entry):
+    """The GT masks are stored as flat buffers reshaped to (entry.height, entry.width), and
+    predictions are produced at the fetched image's size. If those disagree the image is the
+    WRONG one -- a size check is not a correctness check, but a mismatch is proof of
+    misalignment, so fail loudly instead of scoring against another image's ground truth."""
+    got = (img.size[1], img.size[0])
+    want = (entry["height"], entry["width"])
+    if got != want:
+        raise ValueError(f"{entry['img_id']}: fetched image is {got}, benchmark recorded "
+                         f"{want} -- image/metadata misalignment, refusing to score it")
+    return img
+
+
 def fetch_image(entry):
     """PIL image (RGB) for one img_metadata.pkl entry. lvis downloads by URL
     (img_url is a real COCO CDN url, since LVIS images ARE COCO images);
@@ -152,11 +210,11 @@ def fetch_image(entry):
     if src == "lvis":
         r = requests.get(entry["img_url"], timeout=30)
         r.raise_for_status()
-        return Image.open(BytesIO(r.content)).convert("RGB")
+        return _verify_dims(Image.open(BytesIO(r.content)).convert("RGB"), entry)
     if src == "ade20k":
-        return _ade20k_dataset()[entry["img_src_id"]]["image"].convert("RGB")
+        return _verify_dims(_ade20k_dataset()[_ade20k_row_for(entry)]["image"].convert("RGB"), entry)
     if src == "pascalvoc":
-        return _pascalvoc_dataset()[entry["img_src_id"]]["image"].convert("RGB")
+        return _verify_dims(_pascalvoc_dataset()[entry["img_src_id"]]["image"].convert("RGB"), entry)
     raise ValueError(f"Unknown img_src '{src}'")
 
 

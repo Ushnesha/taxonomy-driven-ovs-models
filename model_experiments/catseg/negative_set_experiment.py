@@ -22,18 +22,35 @@ Usage:
 """
 import argparse
 import os
+import random
 
 import benchmark_data as bd
 import approaches as ap
 from catseg import CATSegModel
 
+SAMPLE_SEED = 42  # --limit-images takes a SEEDED RANDOM sample, not the first N: the
+                  # benchmark JSON's image order is not random, so img_ids[:N] biases the
+                  # subset. Seeded per (seed, category) so it is reproducible AND draws the
+                  # same images as the clipseg/sclip/groupvit runs, making the cross-model
+                  # comparison paired at the image level.
+
+THRESHOLD = 0.0   # CAT-Seg classifies each pixel by ARGMAX over its whole joint softmax;
+                  # its own evaluation applies no confidence floor. With a 326-class
+                  # vocabulary the winning softmax probability is routinely well below 0.5,
+                  # so the previous default of 0.5 would have blanked most masks and made
+                  # every approach look equally bad. This is exactly the bug that invalidated
+                  # a full SCLIP run (prob_thd 0.5 vs its published 0.1) -- keep 0.0 unless
+                  # you have a specific reason, and record --threshold in the run log.
+
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 FIELDNAMES = ["category", "variant", "variant_word", "img_id", "approach", "fpr"]
 
 
-def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=0.5):
+def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=None):
     """See positive_set_experiment.py's version of this function -- CAT-Seg needs one call
     per tag, all keyed by the real class name `cat_name`."""
+    if threshold is None:
+        threshold = THRESHOLD
     masks = {}
     for tag, emb in tag_to_embedding.items():
         result = model.predict_with_embeddings(image, {cat_name: emb}, threshold=threshold)
@@ -42,8 +59,9 @@ def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=0
 
 
 def run(alpha, weighted, out_path, benchmark_dir, config=None, weights=None, catseg_path=None,
+        exclude_sources=(), sample_seed=SAMPLE_SEED,
         limit_categories=None, limit_images=None, device=None):
-    bm = bd.load_benchmark(benchmark_dir)
+    bm = bd.load_benchmark(benchmark_dir, exclude_sources=exclude_sources)
 
     catseg_class_json = os.path.join(os.path.dirname(out_path) or ".", "catseg_class_names.json")
     bd.build_catseg_class_json(bm, catseg_class_json)
@@ -62,8 +80,9 @@ def run(alpha, weighted, out_path, benchmark_dir, config=None, weights=None, cat
         for cat_name in categories:
             variants = bd.get_variants(cat_name, bm.word_sets)
             img_ids = bm.negative_set.get(cat_name, [])
-            if limit_images:
-                img_ids = img_ids[:limit_images]
+            if limit_images and len(img_ids) > limit_images:
+                img_ids = sorted(random.Random(f"{sample_seed}:{cat_name}").sample(
+                    img_ids, limit_images))
 
             for img_id in img_ids:
                 key = (cat_name, str(img_id))
@@ -138,6 +157,14 @@ if __name__ == "__main__":
     parser.add_argument("--limit-images", type=int, default=5,
                          help="negative sets are huge (every other image in the benchmark); "
                               "default caps at 5 per category for sane local/default runs -- pass -1 for full scale")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD,
+                         help="confidence floor on CAT-Seg's joint-softmax argmax. Default 0.0 "
+                              "= pure argmax, matching CAT-Seg's own evaluation.")
+    parser.add_argument("--exclude-sources", default="",
+                         help="comma-separated img_src values to drop entirely, e.g. 'ade20k'.")
+    parser.add_argument("--sample-seed", type=int, default=SAMPLE_SEED,
+                         help="seed for the --limit-images random sample; keep at 42 to draw "
+                              "the same images as the other models' runs")
     parser.add_argument("--out-dir", default=RESULTS_DIR)
     parser.add_argument("--allow-baseline", action="store_true",
                          help="Allow CLIPSeg-fallback baseline mode even at full scale -- i.e. permit a "
@@ -156,12 +183,21 @@ if __name__ == "__main__":
             "small local pipeline check instead, or --allow-baseline to override."
         )
 
+    from provenance import RunMeta, count_csv_rows
+    meta = RunMeta(args.out_dir, args, __file__)
+
+    THRESHOLD = args.threshold
+
     out_path = os.path.join(args.out_dir, "negative_set_experiment_catseg.csv")
     summary_path = os.path.join(args.out_dir, "negative_set_experiment_catseg_summary.csv")
 
+    exclude_sources = tuple(x.strip() for x in args.exclude_sources.split(",") if x.strip())
     run(args.alpha, args.weighted, out_path, args.benchmark_dir,
         config=args.config, weights=args.weights, catseg_path=args.catseg_path,
+        exclude_sources=exclude_sources, sample_seed=args.sample_seed,
         limit_categories=args.limit_categories, limit_images=limit_images, device=args.device)
 
     bd.summarize_csv(out_path, ["approach", "variant"], "fpr", summary_path)
     print(f"summary written to {summary_path}")
+    meta.finish(detail_csv=out_path, summary_csv=summary_path,
+                n_detail_rows=count_csv_rows(out_path))

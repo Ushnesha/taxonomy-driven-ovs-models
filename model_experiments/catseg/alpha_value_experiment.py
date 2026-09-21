@@ -76,12 +76,22 @@ def get_model():
 def get_text_embedding_cached(word: str):
     if word in _embedding_cache:
         return _embedding_cache[word].clone()
-    emb = get_model().get_text_embedding(word, desc=True)
+    # .float(): CAT-Seg's CLIP backbone may load in fp16, and torch.dot has no CPU
+    # kernel for Half -- cosine_sim's `a @ b` would raise. Casting at the cache (not
+    # only in cosine_sim) also keeps compute_centroid and compute_weighted_centroid
+    # in the same dtype, so the weighted/unweighted arms stay comparable.
+    emb = get_model().get_text_embedding(word, desc=True).float()
     _embedding_cache[word] = emb.cpu()
     return emb
 
 
-def run_segmentation_batch(image, cond_embeddings, cat_name, threshold=0.5):
+THRESHOLD = 0.0   # CAT-Seg assigns each pixel by ARGMAX over its joint softmax and its
+                  # own evaluation applies no confidence floor. With a large vocabulary the
+                  # winning probability is routinely below 0.5, so a 0.5 default blanks most
+                  # masks -- the same class of bug that invalidated a full SCLIP run.
+
+
+def run_segmentation_batch(image, cond_embeddings, cat_name, threshold=None):
     """CAT-Seg's predict_with_embeddings() only accepts one embedding per call, keyed by a
     real class name (its joint-softmax interface swaps one vocabulary row in per call --
     see catseg.py's module docstring), unlike CLIPSeg/GroupViT's arbitrary-tag batching. So
@@ -89,7 +99,8 @@ def run_segmentation_batch(image, cond_embeddings, cat_name, threshold=0.5):
     embedding here is a variant/blend of)."""
     masks = []
     for emb in cond_embeddings:
-        result = get_model().predict_with_embeddings(image, {cat_name: emb}, threshold=threshold)
+        result = get_model().predict_with_embeddings(image, {cat_name: emb}, threshold=
+                                                     THRESHOLD if threshold is None else threshold)
         masks.append(result[cat_name])
     return masks
 
@@ -194,7 +205,7 @@ def eligible_synset(word):
 
 
 def cosine_sim(a, b):
-    a, b = a.squeeze(), b.squeeze()
+    a, b = a.squeeze().float(), b.squeeze().float()
     return (a @ b).item() / (a.norm().item() * b.norm().item())
 
 
@@ -561,6 +572,9 @@ if __name__ == "__main__":
                          help="-1 = every eligible COCO category (the real, intended run)")
     parser.add_argument("--n-images", type=int, default=N_IMAGES,
                          help="-1 = every positive image per category (the real, intended run)")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD,
+                         help="confidence floor on CAT-Seg's argmax. Default 0.0 = pure "
+                              "argmax, matching CAT-Seg's own evaluation.")
     parser.add_argument("--out-dir", default="./results")
     parser.add_argument("--config", default=None,
                          help="CAT-Seg Detectron2 config, e.g. ./CAT-Seg/configs/vitl_336.yaml. "
@@ -574,6 +588,11 @@ if __name__ == "__main__":
                               "--limit-images caps -- i.e. permit a 'full-scale' run that is NOT real "
                               "CAT-Seg. Off by default so this can never silently happen.")
     args = parser.parse_args()
+
+    from provenance import RunMeta, count_csv_rows
+    meta = RunMeta(args.out_dir, args, __file__)
+
+    THRESHOLD = args.threshold
 
     is_full_scale = args.n_categories < 0 or args.n_images < 0
     have_real_model = args.config is not None and args.weights is not None
@@ -614,8 +633,12 @@ if __name__ == "__main__":
     if args.grid in ("coarse", "both"):
         run_grid("coarse", ALPHA_GRID_COARSE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
+        summarize(detail_out, summary_out)   # so a "both" run that dies in the fine grid
+                                             # still leaves a usable coarse summary
     if args.grid in ("fine", "both"):
         run_grid("fine", ALPHA_GRID_FINE, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
 
     summarize(detail_out, summary_out)
+    meta.finish(detail_csv=detail_out, summary_csv=summary_out,
+                n_detail_rows=count_csv_rows(detail_out))

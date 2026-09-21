@@ -137,6 +137,7 @@ class CATSegModel(BaseOVSModel):
             print("  checkpoint/detectron2 -- never trust these numbers as CAT-Seg results.")
             print("=" * 78)
             self.clipseg = CLIPSegModel(device=self.device)
+            self._logged_cache_shape = True   # nothing to log: no CAT-Seg cache in baseline mode
             return
 
         if not class_name_path:
@@ -184,6 +185,7 @@ class CATSegModel(BaseOVSModel):
         self.demo = VisualizationDemo(cfg)
         self._predictor_module = self._locate_predictor_module()
         self._lock = threading.Lock()  # self._predictor_module.cache is shared mutable state
+        self._logged_cache_shape = False  # set on the first _warm_cache()
 
     def _locate_predictor_module(self):
         """The CATSegPredictor instance holding .cache/.clip_model/.tokenizer/
@@ -226,7 +228,16 @@ class CATSegModel(BaseOVSModel):
         pred = self._predictor_module
         text = word if desc else DEFAULT_PROMPT_TEMPLATE.format(word)
         tok_fn = pred.tokenizer if pred.tokenizer is not None else self._clip_module.tokenize
-        tokens = tok_fn([text])
+        # truncate=True: CLIP's text encoder has a hard 77-token limit. SHiNe's
+        # "a X, which is a Y, which is a Z, ..." sentences, built from WordNet hypernym
+        # paths, routinely exceed it, and OpenAI CLIP's tokenize() defaults to
+        # truncate=False -- which RAISES rather than truncating. This killed the CLIPSeg
+        # and SCLIP runs partway through their first real dry run; do not remove it.
+        # Guarded because a HF-style tokenizer (pred.tokenizer) takes different kwargs.
+        try:
+            tokens = tok_fn([text], truncate=True)
+        except TypeError:
+            tokens = tok_fn([text], truncation=True, max_length=77)
         if hasattr(tokens, "to"):
             tokens = tokens.to(self.device)
         with torch.no_grad():
@@ -251,6 +262,32 @@ class CATSegModel(BaseOVSModel):
                 "calling get_text_embeds() -- CAT-Seg's caching behavior may have changed; "
                 "see this file's module docstring before trusting predict_with_embeddings."
             )
+
+        # The cache is [num_classes, num_templates, dim]. num_templates depends on
+        # cfg.MODEL.PROMPT_ENSEMBLE_TYPE: 1 for "single", but ~80 for "imagenet" /
+        # "imagenet_select". That matters enormously -- see _swap_row below -- so assert
+        # the rank once, loudly, instead of letting a shape assumption fail silently.
+        if pred.cache.dim() != 3:
+            raise RuntimeError(
+                f"CATSegModel: expected predictor cache of rank 3 "
+                f"[num_classes, num_templates, dim], got shape {tuple(pred.cache.shape)}. "
+                f"predict_with_embeddings' row-swap indexing assumes rank 3 -- inspect "
+                f"CAT-Seg's CATSegPredictor.get_text_embeds() before trusting any numbers."
+            )
+        if not self._logged_cache_shape:
+            n_cls, n_tpl, dim = pred.cache.shape
+            print(f"[CATSegModel] text-embedding cache: {n_cls} classes x {n_tpl} "
+                  f"prompt template(s) x {dim} dims", flush=True)
+            if n_tpl > 1:
+                print(f"[CATSegModel] NOTE: {n_tpl} prompt templates are ensembled. "
+                      f"predict_with_embeddings overwrites ALL {n_tpl} template rows for "
+                      f"the target class with the single injected embedding, so the "
+                      f"injection is not diluted. get_text_embedding() correspondingly "
+                      f"uses one template (DEFAULT_PROMPT_TEMPLATE), which means an "
+                      f"injected 'baseline' embedding is NOT bit-identical to the model's "
+                      f"own ensembled row for that class -- expected, and consistent "
+                      f"across all 5 approaches, so comparisons remain fair.", flush=True)
+            self._logged_cache_shape = True
 
     def predict_with_embeddings(self, image_pil, embeddings_dict, threshold=0.5):
         """
@@ -282,10 +319,21 @@ class CATSegModel(BaseOVSModel):
                     raise ValueError(f"expected a 1-D embedding for '{key}', got shape {tuple(e.shape)}")
                 e = e / e.norm()
 
-                original_row = pred.cache[idx, 0, :].clone()
+                # Overwrite EVERY prompt-template row for this class, not just row 0.
+                # CAT-Seg's cost aggregation consumes all num_templates rows; with
+                # PROMPT_ENSEMBLE_TYPE="imagenet" that is ~80 rows, so writing only
+                # [idx, 0, :] would leave ~79/80 of the class's signal as the model's
+                # ORIGINAL embedding. The alpha sweep would then produce a nearly flat
+                # IoU-vs-alpha curve and look like "blending does nothing" -- a silent
+                # false negative, not a crash. This is the CLIPSeg "person" bug
+                # (8 sub-prompts, one embedding) in a different guise.
+                original_rows = pred.cache[idx].clone()          # [num_templates, dim]
                 try:
-                    pred.cache[idx, 0, :] = e
-                    predictions, _ = self.demo.run_on_image(img_bgr)
+                    pred.cache[idx] = e.unsqueeze(0).expand_as(original_rows)
+                    # predictor(), not demo.run_on_image(): the latter also renders a
+                    # visualization we immediately discard, on every one of the
+                    # ~20 forward passes per image.
+                    predictions = self.demo.predictor(img_bgr)
                     sem_seg = predictions["sem_seg"]
                     if not torch.is_tensor(sem_seg):
                         sem_seg = torch.as_tensor(np.asarray(sem_seg))
@@ -294,6 +342,6 @@ class CATSegModel(BaseOVSModel):
                     label_np, conf_np = label.cpu().numpy(), conf.cpu().numpy()
                     pred_masks[key] = ((label_np == idx) & (conf_np > threshold)).astype(np.uint8)
                 finally:
-                    pred.cache[idx, 0, :] = original_row
+                    pred.cache[idx] = original_rows
 
         return pred_masks
