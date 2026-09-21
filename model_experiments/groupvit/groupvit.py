@@ -63,7 +63,14 @@ class GroupViTOVSModel(BaseOVSModel):
         the norm you hand it.
         """
         prompt = word if desc else f"a photo of a {word}"
-        inputs = self.processor(text=[prompt], return_tensors="pt", padding=True).to(self.device)
+        # truncation=True: CLIP's text encoder has a hard 77-token limit
+        # (max_position_embeddings). SHiNe's "a X, which is a Y, which is a Z, ..."
+        # sentences, built from WordNet hypernym paths, routinely exceed it and the
+        # processor raises instead of truncating. The class name is first in those
+        # sentences, so truncation drops only the most abstract tail ancestors -- the
+        # same behaviour CLIP's own tokenizer has.
+        inputs = self.processor(text=[prompt], return_tensors="pt", padding=True,
+                                 truncation=True, max_length=77).to(self.device)
 
         with torch.inference_mode():
             text_outputs = self.model.text_model(

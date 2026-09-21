@@ -15,10 +15,16 @@ Usage:
 """
 import argparse
 import os
+import random
 
 import benchmark_data as bd
 import approaches as ap
 from groupvit import GroupViTOVSModel
+
+SAMPLE_SEED = 42  # --limit-images takes a SEEDED RANDOM sample, not the first N: the
+                  # benchmark JSON's image order is not random, so img_ids[:N] biases the
+                  # subset. Seeded per (seed, category) so it is reproducible and each
+                  # category's draw is independent of the others.
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 FIELDNAMES = ["category", "variant", "variant_word", "img_id", "approach", "fpr"]
@@ -30,8 +36,8 @@ def predict_masks_for_tags(model, image, tag_to_embedding, threshold=0.5):
     return model.predict_with_embeddings(image, tag_to_embedding, threshold=threshold)
 
 
-def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_images=None, device=None):
-    bm = bd.load_benchmark(benchmark_dir)
+def run(alpha, weighted, out_path, benchmark_dir, exclude_sources=(), limit_categories=None, limit_images=None, device=None, sample_seed=SAMPLE_SEED):
+    bm = bd.load_benchmark(benchmark_dir, exclude_sources=exclude_sources)
     print("Loading GroupViT (nvidia/groupvit-gcc-yfcc)...", flush=True)
     model = GroupViTOVSModel(device=device)
 
@@ -45,8 +51,9 @@ def run(alpha, weighted, out_path, benchmark_dir, limit_categories=None, limit_i
         for cat_name in categories:
             variants = bd.get_variants(cat_name, bm.word_sets)
             img_ids = bm.negative_set.get(cat_name, [])
-            if limit_images:
-                img_ids = img_ids[:limit_images]
+            if limit_images and len(img_ids) > limit_images:
+                img_ids = sorted(random.Random(f"{sample_seed}:{cat_name}").sample(
+                    img_ids, limit_images))
 
             for img_id in img_ids:
                 key = (cat_name, str(img_id))
@@ -115,15 +122,28 @@ if __name__ == "__main__":
     parser.add_argument("--limit-images", type=int, default=5,
                          help="negative sets are huge (every other image in the benchmark); "
                               "default caps at 5 per category for sane local/default runs -- pass -1 for full scale")
+    parser.add_argument("--exclude-sources", default="",
+                         help="comma-separated img_src values to drop entirely, e.g. 'ade20k'. "
+                              "Use when a source's HF row indices no longer align with the "
+                              "frozen benchmark. Excluding a WHOLE source is the only safe "
+                              "option -- never filter per-image on a size check.")
+    parser.add_argument("--sample-seed", type=int, default=SAMPLE_SEED,
+                         help="seed for the --limit-images random sample")
     parser.add_argument("--out-dir", default=RESULTS_DIR)
     args = parser.parse_args()
+
+    from provenance import RunMeta, count_csv_rows
+    meta = RunMeta(args.out_dir, args, __file__)
 
     limit_images = None if args.limit_images is not None and args.limit_images < 0 else args.limit_images
     out_path = os.path.join(args.out_dir, "negative_set_experiment_groupvit.csv")
     summary_path = os.path.join(args.out_dir, "negative_set_experiment_groupvit_summary.csv")
 
-    run(args.alpha, args.weighted, out_path, args.benchmark_dir,
-        limit_categories=args.limit_categories, limit_images=limit_images, device=args.device)
+    exclude_sources = tuple(x.strip() for x in args.exclude_sources.split(",") if x.strip())
+    run(args.alpha, args.weighted, out_path, args.benchmark_dir, exclude_sources=exclude_sources,
+        limit_categories=args.limit_categories, limit_images=limit_images, sample_seed=args.sample_seed, device=args.device)
 
     bd.summarize_csv(out_path, ["approach", "variant"], "fpr", summary_path)
     print(f"summary written to {summary_path}")
+    meta.finish(detail_csv=out_path, summary_csv=summary_path,
+                n_detail_rows=count_csv_rows(out_path))

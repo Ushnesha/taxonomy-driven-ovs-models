@@ -169,11 +169,14 @@ class SClipModel(BaseOVSModel):
         template-free, as the single query.
         """
         with torch.no_grad():
+            # truncate=True: OpenAI CLIP's tokenize() defaults to truncate=False, which
+            # RAISES on input over the 77-token context length. SHiNe's WordNet
+            # hypernym-chain sentences routinely exceed it.
             if desc:
-                query = self._clip_module.tokenize([word]).to(self.device)
+                query = self._clip_module.tokenize([word], truncate=True).to(self.device)
             else:
                 query = self._clip_module.tokenize(
-                    [t(word) for t in self._template_list]
+                    [t(word) for t in self._template_list], truncate=True
                 ).to(self.device)
             feature = self.model.net.encode_text(query)
             feature = feature / feature.norm(dim=-1, keepdim=True)
