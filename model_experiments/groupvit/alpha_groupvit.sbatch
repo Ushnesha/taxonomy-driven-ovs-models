@@ -15,7 +15,9 @@
 # "both" still leaves a usable coarse summary.
 #
 #SBATCH --job-name=alpha_groupvit
-#SBATCH --partition=general
+#SBATCH --partition=public      # NOT 'general': as of the May 2026 SOL maintenance,
+                                # 'general' holds only privately-owned nodes and
+                                # 'public' is the partition for public ones.
 #SBATCH --qos=public
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6

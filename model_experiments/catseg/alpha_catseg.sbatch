@@ -41,6 +41,7 @@ PY=$EXPDIR/catseg_venv/bin/python          # absolute path -- `conda activate` s
 COCO_DIR=$HOME/workspace/OVS/coco_data
 OUT=${2:-$HOME/workspace/OVS/results/alpha_catseg_$(date +%Y%m%d_%H%M%S)}
 N_IMAGES=${3:-350}
+FINE_RANGE=${4:-}            # e.g. "0.75,0.85,0.02" -- ONLY meaningful with grid=fine
 
 # Override from the command line without editing this file, e.g.
 #   CATSEG_WEIGHTS=/scratch/$USER/model_base.pth \
@@ -89,14 +90,11 @@ if not torch.cuda.is_available():
 print("deps ok")
 PYEOF
 
-$PY alpha_value_experiment.py \
-    --coco-dir "$COCO_DIR" \
-    --config "$CONFIG" \
-    --weights "$WEIGHTS" \
-    --grid "$GRID" \
-    --n-categories -1 \
-    --n-images "$N_IMAGES" \
-    --out-dir "$OUT"
+ARGS=(--coco-dir "$COCO_DIR" --config "$CONFIG" --weights "$WEIGHTS"
+      --grid "$GRID" --n-categories -1 --n-images "$N_IMAGES" --out-dir "$OUT")
+[ -n "$FINE_RANGE" ] && ARGS+=(--fine-range "$FINE_RANGE")
+
+$PY alpha_value_experiment.py "${ARGS[@]}"
 
 echo "DONE ($GRID) -> $OUT"
 ls -la "$OUT"

@@ -30,9 +30,13 @@
 set -euo pipefail
 
 SET=${1:?usage: sbatch benchmark_catseg.sbatch <positive|negative> [out_dir] [limit_images]}
-ALPHA=${ALPHA:-0.69}        # OVERRIDE ME once alpha_catseg.sbatch has run: CAT-Seg's own
-                            # sweep value, not CLIPSeg's. Exported so you can do
-                            #   ALPHA=0.8 sbatch benchmark_catseg.sbatch positive
+ALPHA=${ALPHA:-0.80}        # CAT-Seg's OWN sweep value (not CLIPSeg's 0.69):
+                            #   coarse grid peak alpha=0.80  mean_iou 0.336930  (n=20917)
+                            #   fine   0.74-0.86 step 0.02, peak alpha=0.80    0.336980
+                            # The whole fine range spans 0.000401, so this is a very flat
+                            # optimum -- the exact value barely matters. WEIGHTED centroid
+                            # beats unweighted by 0.001215, hence --weighted below.
+                            # Override per submission with:  ALPHA=0.78 sbatch ...
 REPO=$HOME/workspace/OVS/taxonomy-driven-ovs-models
 EXPDIR=$REPO/model_experiments/catseg
 PY=$EXPDIR/catseg_venv/bin/python

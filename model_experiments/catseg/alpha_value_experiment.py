@@ -581,6 +581,12 @@ if __name__ == "__main__":
                          help="-1 = every eligible COCO category (the real, intended run)")
     parser.add_argument("--n-images", type=int, default=N_IMAGES,
                          help="-1 = every positive image per category (the real, intended run)")
+    parser.add_argument("--fine-range", default=None,
+                         help="override ALPHA_GRID_FINE as 'lo,hi,step', e.g. '0.75,0.85,0.02'. "
+                              "The built-in fine grid is 0.50-0.80, which was chosen around "
+                              "CLIPSeg's peak -- if THIS model's coarse peak sits elsewhere, "
+                              "the default grid will not even sample it. Always set this "
+                              "from the coarse result rather than trusting the default.")
     parser.add_argument("--threshold", type=float, default=THRESHOLD,
                          help="confidence floor on CAT-Seg's argmax. Default 0.0 = pure "
                               "argmax, matching CAT-Seg's own evaluation.")
@@ -644,8 +650,20 @@ if __name__ == "__main__":
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
         summarize(detail_out, summary_out)   # so a "both" run that dies in the fine grid
                                              # still leaves a usable coarse summary
+    fine_grid = ALPHA_GRID_FINE
+    if args.fine_range:
+        try:
+            lo, hi, step = (float(x) for x in args.fine_range.split(","))
+        except ValueError:
+            parser.error("--fine-range must be 'lo,hi,step', e.g. '0.75,0.85,0.02'")
+        if not (0.0 <= lo <= hi <= 1.0) or step <= 0:
+            parser.error(f"--fine-range invalid: lo={lo} hi={hi} step={step}")
+        n_steps = int(round((hi - lo) / step)) + 1
+        fine_grid = [round(lo + step * i, 4) for i in range(n_steps)]
+        print(f"fine grid overridden: {fine_grid}  ({len(fine_grid)} alphas)")
+
     if args.grid in ("fine", "both"):
-        run_grid("fine", ALPHA_GRID_FINE, coco, coco_dir, cat_name_to_id, positive_set,
+        run_grid("fine", fine_grid, coco, coco_dir, cat_name_to_id, positive_set,
                   hyper_siblings, args.n_categories, args.n_images, detail_out)
 
     summarize(detail_out, summary_out)
