@@ -138,6 +138,7 @@ class CATSegModel(BaseOVSModel):
             print("=" * 78)
             self.clipseg = CLIPSegModel(device=self.device)
             self._logged_cache_shape = True   # nothing to log: no CAT-Seg cache in baseline mode
+            self._logged_semseg_form = True
             return
 
         if not class_name_path:
@@ -173,11 +174,28 @@ class CATSegModel(BaseOVSModel):
         add_deeplab_config(cfg)
         add_cat_seg_config(cfg)
         cfg.merge_from_file(config)
-        cfg.merge_from_list([
+        # CAT-Seg's configs reference their class-name JSONs by paths RELATIVE to the
+        # CAT-Seg repo root ("datasets/coco.json"), so they only resolve if the process
+        # happens to be cwd'd there. Our scripts run from model_experiments/<model>/, so
+        # they don't -- hence:
+        #   FileNotFoundError: [Errno 2] No such file or directory: 'datasets/coco.json'
+        # Override BOTH class-json settings with our absolute vocabulary path. TRAIN_
+        # matters as well as TEST_: CATSegPredictor reads both at construction time, and
+        # only TEST_ was being overridden.
+        overrides = [
             "MODEL.WEIGHTS", weights,
-            "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON", class_name_path,
+            "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON", os.path.abspath(class_name_path),
+            "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON", os.path.abspath(class_name_path),
             "MODEL.DEVICE", self.device,
-        ])
+        ]
+        try:
+            cfg.merge_from_list(overrides)
+        except Exception as e:
+            raise RuntimeError(
+                f"CATSegModel: could not apply config overrides {overrides[::2]} -- this "
+                f"CAT-Seg config may name its class-json keys differently. Inspect "
+                f"`{config}` and cat_seg/config.py."
+            ) from e
         cfg.freeze()
 
         print(f"[CATSegModel] Building real CAT-Seg (config={config}, weights={weights}, "
@@ -186,6 +204,7 @@ class CATSegModel(BaseOVSModel):
         self._predictor_module = self._locate_predictor_module()
         self._lock = threading.Lock()  # self._predictor_module.cache is shared mutable state
         self._logged_cache_shape = False  # set on the first _warm_cache()
+        self._logged_semseg_form = False  # set on the first forward pass
 
     def _locate_predictor_module(self):
         """The CATSegPredictor instance holding .cache/.clip_model/.tokenizer/
@@ -215,6 +234,49 @@ class CATSegModel(BaseOVSModel):
             )
         return idx
 
+    def _tokenize(self, tok_fn, text):
+        """Tokenize `text`, truncating to CLIP's 77-token context however this
+        tokenizer supports it.
+
+        Three tokenizers can turn up here and they disagree on the API:
+          * HF-style (pred.tokenizer set)      -> truncation=True, max_length=77
+          * recent OpenAI CLIP                 -> truncate=True
+          * CAT-Seg's VENDORED third_party/clip -> neither; it predates `truncate`
+            and simply RAISES on anything over 77 tokens.
+
+        The last case is what CAT-Seg actually ships, so we truncate by hand there:
+        shorten the text and retry until it fits. This matters because SHiNe builds
+        "a X, which is a Y, which is a Z, ..." chains from WordNet hypernym paths that
+        routinely blow past 77 tokens -- the same thing that killed the CLIPSeg and
+        SCLIP dry runs. Dropping trailing words is the right loss: SHiNe puts the class
+        name FIRST, so what goes is the most abstract tail ancestors.
+
+        Results are cached upstream by approaches.embed(), so the retry loop runs at
+        most once per distinct string.
+        """
+        import inspect
+        try:
+            params = inspect.signature(tok_fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        if "truncation" in params:
+            return tok_fn([text], truncation=True, max_length=77)
+        if "truncate" in params:
+            return tok_fn([text], truncate=True)
+
+        # No truncation support: shrink until it fits.
+        words = text.split()
+        while True:
+            try:
+                return tok_fn([" ".join(words)])
+            except RuntimeError:
+                if len(words) <= 1:
+                    raise
+                # 90% each round: a handful of iterations even for a very long chain,
+                # and it stops as soon as it fits rather than over-trimming.
+                words = words[:max(1, int(len(words) * 0.9))]
+
     def get_text_embedding(self, word, desc=False):
         """
         L2-normalized text embedding for `word` -- CAT-Seg's own convention (see module
@@ -228,16 +290,7 @@ class CATSegModel(BaseOVSModel):
         pred = self._predictor_module
         text = word if desc else DEFAULT_PROMPT_TEMPLATE.format(word)
         tok_fn = pred.tokenizer if pred.tokenizer is not None else self._clip_module.tokenize
-        # truncate=True: CLIP's text encoder has a hard 77-token limit. SHiNe's
-        # "a X, which is a Y, which is a Z, ..." sentences, built from WordNet hypernym
-        # paths, routinely exceed it, and OpenAI CLIP's tokenize() defaults to
-        # truncate=False -- which RAISES rather than truncating. This killed the CLIPSeg
-        # and SCLIP runs partway through their first real dry run; do not remove it.
-        # Guarded because a HF-style tokenizer (pred.tokenizer) takes different kwargs.
-        try:
-            tokens = tok_fn([text], truncate=True)
-        except TypeError:
-            tokens = tok_fn([text], truncation=True, max_length=77)
+        tokens = self._tokenize(tok_fn, text)
         if hasattr(tokens, "to"):
             tokens = tokens.to(self.device)
         with torch.no_grad():
@@ -289,7 +342,53 @@ class CATSegModel(BaseOVSModel):
                       f"across all 5 approaches, so comparisons remain fair.", flush=True)
             self._logged_cache_shape = True
 
-    def predict_with_embeddings(self, image_pil, embeddings_dict, threshold=0.5):
+    def _as_probabilities(self, sem_seg):
+        """Return per-pixel class probabilities, applying softmax only if needed.
+
+        Detectron2 semantic segmentors -- CAT-Seg included -- return `sem_seg` already
+        normalised over the class dimension. Calling .softmax(0) on it AGAIN is not a
+        harmless no-op: softmax of an already-flat distribution over 326 classes squashes
+        every value toward 1/326 ~= 0.003, so the max confidence never clears any
+        meaningful threshold and EVERY mask comes back empty, for every class, always.
+        That is precisely what was observed: person / building / sofa all 0 pixels on
+        images that contain them.
+
+        argmax is unaffected (softmax is monotonic), so this only matters once a
+        confidence threshold is involved -- which is why it hid until now.
+        """
+        if sem_seg.dim() != 3:
+            raise RuntimeError(
+                f"CATSegModel: expected sem_seg of shape [num_classes, H, W], got "
+                f"{tuple(sem_seg.shape)}."
+            )
+        x = sem_seg.float()
+        col_sums = x.sum(0)
+        # Tolerance is deliberately loose. Detectron2 resizes sem_seg back to the
+        # original image resolution with bilinear interpolation AFTER normalising, so
+        # per-pixel sums drift off 1.0 (observed: ~0.93 on a 500x345 image). A strict
+        # atol=1e-2 misreads that as logits and applies a second softmax. Logits are
+        # unbounded and would not sit in [0, 1] summing to ~1, so this stays unambiguous.
+        already_normalised = bool(
+            torch.all(x >= -1e-4)
+            and float(x.max()) <= 1.0 + 1e-3
+            and 0.8 <= float(col_sums.mean()) <= 1.2
+        )
+        if not self._logged_semseg_form:
+            print(f"[CATSegModel] sem_seg {tuple(sem_seg.shape)} "
+                  f"min={x.min():.4g} max={x.max():.4g} "
+                  f"per-pixel sum~={col_sums.mean():.4g} -> "
+                  f"{'already probabilities, softmax SKIPPED' if already_normalised else 'treating as logits, applying softmax'}",
+                  flush=True)
+            if not already_normalised and float(x.min()) >= 0 and float(x.max()) <= 1:
+                print("[CATSegModel] WARNING: sem_seg is bounded in [0,1] but does NOT sum "
+                      "to 1 per pixel, so it is neither clean logits nor a softmax. A "
+                      "confidence THRESHOLD > 0 is therefore not interpretable on this "
+                      "checkpoint. Masks at threshold 0.0 (the default) are unaffected: "
+                      "argmax does not depend on this.", flush=True)
+            self._logged_semseg_form = True
+        return x if already_normalised else x.softmax(0)
+
+    def predict_with_embeddings(self, image_pil, embeddings_dict, threshold=0.0):
         """
         embeddings_dict: {canonical_category_name: torch.Tensor}, keyed by the real class
         name it should replace in this model's fixed vocabulary -- see module docstring for
@@ -337,10 +436,21 @@ class CATSegModel(BaseOVSModel):
                     sem_seg = predictions["sem_seg"]
                     if not torch.is_tensor(sem_seg):
                         sem_seg = torch.as_tensor(np.asarray(sem_seg))
-                    probs = sem_seg.softmax(0)
-                    conf, label = probs.max(0)
-                    label_np, conf_np = label.cpu().numpy(), conf.cpu().numpy()
-                    pred_masks[key] = ((label_np == idx) & (conf_np > threshold)).astype(np.uint8)
+                    # argmax is invariant under ANY monotonic per-pixel transform, so
+                    # it needs no assumption about whether sem_seg holds logits,
+                    # softmax probabilities or per-class sigmoids. At threshold 0.0
+                    # (CAT-Seg's own evaluation convention) that is all we need, so the
+                    # normalisation question never enters the decision path.
+                    label_np = sem_seg.argmax(0).cpu().numpy()
+                    mask = (label_np == idx)
+                    if threshold > 0:
+                        # Only HERE does the output's semantics matter. It is not
+                        # established for this checkpoint -- observed per-pixel sums of
+                        # 0.07, 0.17 and 0.93 across runs, none of them 1.0 -- so a
+                        # confidence floor is not trustworthy. _as_probabilities warns.
+                        conf_np = self._as_probabilities(sem_seg).max(0)[0].cpu().numpy()
+                        mask &= (conf_np > threshold)
+                    pred_masks[key] = mask.astype(np.uint8)
                 finally:
                     pred.cache[idx] = original_rows
 

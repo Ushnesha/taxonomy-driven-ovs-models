@@ -16,7 +16,9 @@
 # into one CSV.
 #
 #SBATCH --job-name=bench_catseg
-#SBATCH --partition=general
+#SBATCH --partition=public      # NOT 'general': as of the May 2026 SOL maintenance,
+                                # 'general' holds only privately-owned nodes and
+                                # 'public' is the partition for public ones.
 #SBATCH --qos=public
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -49,6 +51,10 @@ export HF_HOME=$HOME/workspace/OVS/hf_cache
 export TORCH_HOME=$HOME/workspace/OVS/torch_cache
 export NLTK_DATA=$HOME/workspace/OVS/nltk_data
 export PYTHONNOUSERSITE=1
+# SOL's /lib64/libstdc++.so.6 predates CXXABI_1.3.15, which the env's libicu
+# needs -- without this every import dies with:
+#   ImportError: /lib64/libstdc++.so.6: version `CXXABI_1.3.15' not found
+export LD_LIBRARY_PATH="$EXPDIR/catseg_venv/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 

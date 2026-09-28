@@ -80,7 +80,16 @@ def get_text_embedding_cached(word: str):
     # kernel for Half -- cosine_sim's `a @ b` would raise. Casting at the cache (not
     # only in cosine_sim) also keeps compute_centroid and compute_weighted_centroid
     # in the same dtype, so the weighted/unweighted arms stay comparable.
-    emb = get_model().get_text_embedding(word, desc=True).float()
+    # desc=False (TEMPLATE the word) -- CAT-Seg-specific, unlike the clipseg/sclip/
+    # groupvit copies which use desc=True. CAT-Seg classifies by a JOINT softmax over
+    # its whole 80-class vocabulary, warmed with its own prompt template. A bare-word
+    # embedding swapped into one row competes from a different region of embedding
+    # space than the 79 templated rows it is up against, and loses badly. Measured on
+    # the sweep's own 8 categories with check_native_iou.py:
+    #     native / templated : 0.3691      bare (desc=True) : ~0.12
+    # This mirrors approaches.embed()'s desc=False -- and this cache is a SEPARATE
+    # code path (the sweep does not import approaches.py), so both must be changed.
+    emb = get_model().get_text_embedding(word, desc=False).float()
     _embedding_cache[word] = emb.cpu()
     return emb
 

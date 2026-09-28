@@ -48,14 +48,37 @@ DEFAULT_TOPK = 5
 _embed_cache = {}
 
 
-def embed(model, word, desc=True):
+def embed(model, word, desc=False):
     """
-    model.get_text_embedding(word, desc=desc), cached per (model, word, desc)
-    for this process. desc=True is used throughout (matches
-    helper_functions.py's convention): every string handed to embed() here is
-    already the full intended prompt (a bare category/variant word, or a full
-    descriptor/candidate sentence for waffleclip/shine/llm_descriptor) -- it
-    should never additionally get wrapped in "a photo of a {}".
+    model.get_text_embedding(word, desc=desc), cached per (model, word, desc).
+
+    NOTE: desc=False here, UNLIKE the clipseg/sclip/groupvit copies of this file,
+    which use desc=True (embed the string verbatim). CAT-Seg needs the opposite,
+    and the difference is worth ~2x IoU.
+
+    CAT-Seg classifies by a JOINT softmax over its whole 80-class vocabulary, and it
+    warms that vocabulary with its own prompt template ("A photo of a {} in the
+    scene"). predict_with_embeddings swaps ONE class's row and leaves the other 79
+    templated. So a bare-word embedding injected into that row is competing from a
+    different region of text-embedding space than everything it competes against,
+    and it loses. Measured on 24 COCO (category, image) pairs with
+    check_native_iou.py:
+
+        NATIVE    (model's own row, no injection) : 0.3123
+        TEMPLATED (desc=False, this setting)      : 0.3123   <- exact parity
+        BARE      (desc=True, the old setting)    : 0.1804   <- 42% worse
+
+    TEMPLATED reproducing NATIVE to four decimals is also the proof that the row-swap
+    injection itself is faithful.
+
+    This applies to descriptor SENTENCES (shine/waffleclip/llm_descriptor) too, not
+    just bare class names: they are injected into the same row and face the same
+    competition, so they go through the same prompt pipeline. The template is part of
+    the MODEL's text pipeline, not part of the query transformation being compared --
+    every approach gets it, so the comparison stays fair.
+
+    For clipseg/groupvit (independent per-prompt sigmoid) there is no competition and
+    hence no such asymmetry, which is why this only surfaced on CAT-Seg.
     """
     key = (id(model), word, desc)
     if key not in _embed_cache:
