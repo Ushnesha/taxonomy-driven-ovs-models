@@ -94,6 +94,32 @@ def _patch_postprocess_class_merge(clip_segmentor):
                     out[c] = logits.index_select(0, rows).amax(0)
             return out
 
+    def _merge_argmax_streaming(logits, query_idx, num_cls):
+        """Per-class max + argmax WITHOUT ever materialising [num_cls, H, W].
+
+        The merged tensor is the single largest allocation in this path. At benchmark
+        scale it is ruinous: 326 classes on a 2200x1650 ADE20K image is 4.4 GiB, on top
+        of the 5.4 GiB the [num_queries, H, W] logits already occupy. On a 19.5 GiB GPU
+        that OOMs (observed: "Tried to allocate 9.06 GiB").
+
+        Only the per-pixel winner and its score are actually needed, so keep a running
+        best over classes: peak extra memory is a couple of [H, W] planes instead of
+        num_cls of them.
+        """
+        idx = query_idx.to(logits.device)
+        hw = logits.shape[1:]
+        best_val = logits.new_full(hw, float("-inf"))
+        best_idx = torch.zeros(hw, dtype=torch.long, device=logits.device)
+        for c in range(num_cls):
+            rows = (idx == c).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            v = logits.index_select(0, rows).amax(0) if rows.numel() > 1 else logits[rows[0]]
+            better = v > best_val
+            best_val = torch.where(better, v, best_val)
+            best_idx = torch.where(better, torch.full_like(best_idx, c), best_idx)
+        return best_val, best_idx
+
     def postprocess_result(self, seg_logits, data_samples):
         batch_size = seg_logits.shape[0]
         for i in range(batch_size):
@@ -101,23 +127,34 @@ def _patch_postprocess_class_merge(clip_segmentor):
             logits = logits.softmax(0)  # num_queries * H * W
 
             num_cls, num_queries = max(self.query_idx) + 1, len(self.query_idx)
-            if num_cls != num_queries:
-                logits = _merge(logits, self.query_idx, num_cls)
 
             if self.area_thd is not None:
+                # area_thd needs the full merged tensor; SCLIP's default is None, so this
+                # branch is not normally taken. Memory-hungry by necessity.
+                if num_cls != num_queries:
+                    logits = _merge(logits, self.query_idx, num_cls)
                 predictions = torch.nn.functional.one_hot(
                     logits.argmax(0), num_cls).to(logits.dtype)
                 area_pred = predictions[:, :, 1:].sum((0, 1), keepdim=True)
                 area_pred = (area_pred > self.area_thd * area_pred.sum()).to(logits.dtype)
                 logits[1:] *= area_pred.transpose(0, -1)
+                best_val, best_idx = logits.max(0)
+            elif num_cls != num_queries:
+                best_val, best_idx = _merge_argmax_streaming(logits, self.query_idx, num_cls)
+            else:
+                best_val, best_idx = logits.max(0)
 
-            seg_pred = logits.argmax(0, keepdim=True)
-            seg_pred[logits.max(0, keepdim=True)[0] < self.prob_thd] = 0
+            seg_pred = best_idx.unsqueeze(0).clone()
+            seg_pred[best_val.unsqueeze(0) < self.prob_thd] = 0
 
+            # 'seg_logits' stores only the winning score, not the full per-class map.
+            # Nothing in this project reads it (_predict_joint uses pred_sem_seg only),
+            # and keeping the full map is what blew the GPU budget.
             data_samples[i].set_data({
-                "seg_logits": clip_segmentor.PixelData(**{"data": logits}),
+                "seg_logits": clip_segmentor.PixelData(**{"data": best_val.unsqueeze(0)}),
                 "pred_sem_seg": clip_segmentor.PixelData(**{"data": seg_pred}),
             })
+            del logits, best_val, best_idx
         return data_samples
 
     cls.postprocess_result = postprocess_result

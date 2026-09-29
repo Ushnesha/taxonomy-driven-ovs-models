@@ -286,17 +286,67 @@ SCLIP_BACKGROUND_LINE = (
 )
 
 
-def build_sclip_name_path(bm, out_path):
+def build_sclip_name_path(bm, out_path, verbose=True):
     """Writes a SCLIP-format class-list file (one line per class, first
     comma-separated token is the class name predict_with_embeddings() keys
     must match) covering every category in `bm`, so SCLIP can be queried
-    against our benchmark instead of just COCO's 80 classes."""
-    lines = [SCLIP_BACKGROUND_LINE]
+    against our benchmark instead of just COCO's 80 classes.
+
+    CRITICAL: the background line (class 0) is pruned of any word that is ALSO a
+    benchmark category, and every query name is made globally unique.
+
+    SCLIP_BACKGROUND_LINE is COCO-Object's *stuff* vocabulary -- "sky, wall, tree,
+    ..., floor, ...". Against COCO's 80 OBJECT classes those words collide with
+    nothing. Against our 326 categories they collide constantly, because the benchmark
+    contains sky, wall, floor, building, window, bed, ... as real categories. The same
+    word then appears both as a query of class 0 and as a query of its own class, and
+    class 0 wins the argmax -- so the real class scores 0 IoU everywhere.
+
+    Measured with diagnose_sclip_prediction.py before this fix (prob_thd=0, so nothing
+    was being suppressed):
+        sky   (gt 38.9% of image): class 0 took 46.2% of the GT region, 'sky'   won 0 px
+        wall  (gt  4.2%)         : class 0 took 50.8% of the GT region, 'wall'  won 0 px
+        floor (gt 31.3%)         : class 0 took 67.7% of the GT region, 'floor' won 1.0%
+    while LVIS categories like "wet suit" -- absent from the background line -- scored a
+    healthy 0.27-0.48. That LVIS-fine / ADE20K-zero split was the tell.
+    """
+    cat_names = {c.lower() for c in bm.categories}
+    bg_words = [w.strip() for w in SCLIP_BACKGROUND_LINE.split(",") if w.strip()]
+    bg_keep = [w for w in bg_words if w.lower() not in cat_names]
+    bg_dropped = [w for w in bg_words if w.lower() in cat_names]
+    if not bg_keep:
+        # Line 0 must exist: sclip.py reads foreground names from readlines()[1:] and
+        # maps them to index i+1, so removing the line would shift every class index.
+        bg_keep = ["background"]
+    if verbose and bg_dropped:
+        print(f"[build_sclip_name_path] dropped {len(bg_dropped)} background word(s) that "
+              f"are also benchmark categories (they would have out-competed their own "
+              f"class): {', '.join(bg_dropped)}")
+
+    lines = [", ".join(bg_keep)]
+    # Reserve EVERY category name up front, before any synonym is considered. A class
+    # name is not droppable -- predict_with_embeddings keys on it -- so it must never be
+    # claimed first by an earlier class's synonym list. This is also what stops the
+    # word_sets_v2.json part-whole errors from doing damage: "wheel" lists "bicycle" as a
+    # synonym, and "bicycle" is its own benchmark category, so that query belongs to
+    # bicycle and is dropped from wheel.
+    used = {w.lower() for w in bg_keep} | {c.lower() for c in bm.categories}
+    dropped_syns = []
     for cat in bm.categories:
         entry = bm.word_sets[cat]
         syns = [to_display_form(w) for w in entry.get("synonyms", [])]
-        syns = [w for w in syns if w.lower() != cat.lower()]
-        lines.append(", ".join([cat] + syns))
+        keep = []
+        for w in syns:
+            if w.lower() in used:
+                dropped_syns.append(f"{cat}:{w}")
+                continue
+            keep.append(w)
+            used.add(w.lower())
+        lines.append(", ".join([cat] + keep))
+    if verbose and dropped_syns:
+        print(f"[build_sclip_name_path] dropped {len(dropped_syns)} synonym query name(s) "
+              f"that duplicated a category or background name; first 10: "
+              f"{', '.join(dropped_syns[:10])}")
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -327,7 +377,7 @@ def build_catseg_class_json(bm, out_path):
 # every orchestration script.
 # =============================================================================
 
-def resumable_csv_writer(path, fieldnames, key_fields):
+def resumable_csv_writer(path, fieldnames, key_fields, also_seen_from=()):
     """Opens `path` for append, returns (file, DictWriter, seen) where `seen`
     is the set of key_fields tuples already written -- callers skip any row
     whose key is already in `seen`, so an interrupted run resumes instead of
@@ -337,6 +387,18 @@ def resumable_csv_writer(path, fieldnames, key_fields):
         os.makedirs(out_dir, exist_ok=True)
     exists = os.path.exists(path)
     seen = set()
+    # `also_seen_from`: extra CSVs to treat as already-done WITHOUT writing to them.
+    # This is what lets a sharded job array inherit an earlier sequential run. Two
+    # processes must never share one output `path` -- their appends interleave and
+    # corrupt the file -- hence separate per-shard files plus this.
+    for extra in also_seen_from:
+        if extra and os.path.exists(extra) and os.path.abspath(extra) != os.path.abspath(path):
+            with open(extra) as ef:
+                for row in csv.DictReader(ef):
+                    try:
+                        seen.add(tuple(row[k] for k in key_fields))
+                    except KeyError:
+                        pass
     if exists:
         with open(path) as f:
             for row in csv.DictReader(f):

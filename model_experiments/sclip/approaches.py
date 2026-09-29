@@ -48,14 +48,40 @@ DEFAULT_TOPK = 5
 _embed_cache = {}
 
 
-def embed(model, word, desc=True):
+def embed(model, word, desc=False):
     """
-    model.get_text_embedding(word, desc=desc), cached per (model, word, desc)
-    for this process. desc=True is used throughout (matches
-    helper_functions.py's convention): every string handed to embed() here is
-    already the full intended prompt (a bare category/variant word, or a full
-    descriptor/candidate sentence for waffleclip/shine/llm_descriptor) -- it
-    should never additionally get wrapped in "a photo of a {}".
+    model.get_text_embedding(word, desc=desc), cached per (model, word, desc).
+
+    desc=False (PROMPT-ENSEMBLE the string). This was desc=True (embed verbatim,
+    template-free) and that was a BUG for SCLIP specifically -- it is why the
+    positive-set run came back as walls of 0.0 IoU while the alpha sweep on the same
+    model reported a healthy 0.2028.
+
+    Why it matters here and not for clipseg/groupvit:
+      * SCLIP classifies every pixel by ONE joint softmax over its whole vocabulary,
+        and CLIPForSegmentation.__init__ warms that vocabulary with the FULL
+        openai_imagenet_template ensemble (SCLIP/clip_segmentor.py:38:
+            clip.tokenize([temp(qw) for temp in openai_imagenet_template])).
+      * predict_with_embeddings swaps ONE class's rows and leaves the other ~325
+        classes as 80-template ensembles.
+      * A bare, template-free embedding injected into that row therefore competes
+        from a different region of text-embedding space than everything it competes
+        against, and loses the argmax almost everywhere -> IoU 0.0. "wheel" loses to
+        "car"/"bicycle"; "garment" loses to "wet suit".
+      * clipseg/groupvit use an INDEPENDENT per-prompt sigmoid. Nothing competes, so
+        the prompt convention is a free choice there, not a handicap. Their copies of
+        this file correctly keep desc=True.
+
+    alpha_value_experiment.py in this folder already used desc=False, which is why the
+    sweep was sound while the benchmark runs were not -- two separate embedding code
+    paths that disagreed. Keep them in step.
+
+    This also templates descriptor SENTENCES (shine/waffleclip/llm_descriptor), not
+    just bare class names: they are injected into the same competing row and face the
+    same asymmetry. The template is part of the MODEL's text pipeline, not part of the
+    query transformation under comparison, and every approach gets it, so the
+    comparison stays fair. check_native_iou.py measures both cases -- rerun it if you
+    want to revisit this for sentences specifically.
     """
     key = (id(model), word, desc)
     if key not in _embed_cache:

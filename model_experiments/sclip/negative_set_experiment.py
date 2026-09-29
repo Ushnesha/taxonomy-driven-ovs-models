@@ -23,10 +23,21 @@ import approaches as ap
 from sclip import SClipModel
 
 # SCLIP's prob_thd is a floor on the JOINT softmax over every benchmark class, not a
-# per-prompt binary sigmoid like CLIPSeg's. Its published config uses 0.1; CLIPSeg's 0.5
-# demands one class hold >50% of the softmax mass, which silently zeroes most categories
-# (it cut mean orig IoU from ~0.34 to ~0.12 in the COCO alpha sweep).
-THRESHOLD = 0.1
+# per-prompt binary sigmoid like CLIPSeg's -- so its correct value depends on HOW MANY
+# classes are in the vocabulary, and cannot be carried over from another configuration.
+THRESHOLD = 0.0   # prob_thd. NOT SCLIP's published 0.1 -- that value is calibrated for
+                  # COCO-Object's 81 classes, and this benchmark's vocabulary is 327
+                  # classes / 670 queries. The winning softmax probability shrinks with
+                  # the query count, so a 0.1 floor suppresses EVERY pixel. Measured with
+                  # check_native_iou.py on 16 (category, image) pairs:
+                  #     prob_thd  0.0    0.005  0.01   0.02   0.05   0.1
+                  #     mean IoU  0.1639 0.1639 0.1589 0.1307 0.0194 0.0000
+                  # 0.0 = pure argmax, which is correct here because the vocabulary has a
+                  # background class (line 0 of the name file) to absorb "none of these" --
+                  # suppression is that class's job, not a confidence floor's.
+                  #
+                  # The 0.1 runs produced walls of 0.0 IoU and ~1e-5 FPR. Any result
+                  # generated before this line changed is invalid.
 
 SAMPLE_SEED = 42  # --limit-images takes a SEEDED RANDOM sample, not the first N: the
                   # benchmark JSON's image order is not random, so img_ids[:N] biases the
@@ -49,7 +60,9 @@ def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=N
     return masks
 
 
-def run(alpha, weighted, out_path, benchmark_dir, exclude_sources=(), limit_categories=None, limit_images=None, device=None, sample_seed=SAMPLE_SEED):
+def run(alpha, weighted, out_path, benchmark_dir, exclude_sources=(), limit_categories=None,
+        limit_images=None, device=None, sample_seed=SAMPLE_SEED,
+        category_shard=None, also_seen_from=()):
     bm = bd.load_benchmark(benchmark_dir, exclude_sources=exclude_sources)
 
     sclip_name_path = os.path.join(os.path.dirname(out_path) or ".", "sclip_name_path.txt")
@@ -61,10 +74,17 @@ def run(alpha, weighted, out_path, benchmark_dir, exclude_sources=(), limit_cate
     categories = bm.categories
     if limit_categories:
         categories = categories[:limit_categories]
+    if category_shard:
+        i, n = category_shard
+        # Interleaved, not contiguous: each shard then gets a similar mix of
+        # easy/hard and large/small categories, so they finish together.
+        categories = categories[i::n]
+        print(f"shard {i}/{n}: {len(categories)} categories")
     print(f"{len(categories)} eligible categories, approaches={ap.ALL_APPROACHES}")
 
     unresolved_counts = {}  # {(approaches that returned None,): times it happened}
-    f, writer, seen = bd.resumable_csv_writer(out_path, FIELDNAMES, ["category", "img_id"])
+    f, writer, seen = bd.resumable_csv_writer(
+        out_path, FIELDNAMES, ["category", "img_id"], also_seen_from=also_seen_from)
     try:
         for cat_name in categories:
             variants = bd.get_variants(cat_name, bm.word_sets)
@@ -167,6 +187,15 @@ if __name__ == "__main__":
                               "option -- never filter per-image on a size check.")
     parser.add_argument("--sample-seed", type=int, default=SAMPLE_SEED,
                          help="seed for the --limit-images random sample")
+    parser.add_argument("--category-shard", default=None,
+                         help="'I/N' -- process only every N-th category starting at I, for a "
+                              "SLURM job array. Each shard writes its own detail CSV "
+                              "(..._shardIofN.csv); merge with merge_shards.py afterwards. "
+                              "SCLIP cannot batch (one joint forward pass per variant x "
+                              "approach), so sharding is the only way to use several GPUs.")
+    parser.add_argument("--also-seen-from", default="",
+                         help="comma-separated existing detail CSVs to treat as already-done "
+                              "WITHOUT writing to them, e.g. a previous sequential run.")
     parser.add_argument("--out-dir", default=RESULTS_DIR)
     args = parser.parse_args()
     THRESHOLD = args.threshold
@@ -175,11 +204,26 @@ if __name__ == "__main__":
     meta = RunMeta(args.out_dir, args, __file__)
 
     limit_images = None if args.limit_images is not None and args.limit_images < 0 else args.limit_images
-    out_path = os.path.join(args.out_dir, "negative_set_experiment_sclip.csv")
-    summary_path = os.path.join(args.out_dir, "negative_set_experiment_sclip_summary.csv")
+    shard = None
+    if args.category_shard:
+        try:
+            i_s, n_s = args.category_shard.split("/")
+            shard = (int(i_s), int(n_s))
+        except ValueError:
+            parser.error("--category-shard must look like '3/8'")
+        if not (0 <= shard[0] < shard[1]):
+            parser.error(f"--category-shard out of range: {args.category_shard}")
+    # Distinct files per shard: two processes appending to one CSV interleave rows, and a
+    # shared summary path would have every task racing to overwrite a partial view.
+    suffix = f"_shard{shard[0]}of{shard[1]}" if shard else ""
+    out_path = os.path.join(args.out_dir, f"negative_set_experiment_sclip{suffix}.csv")
+    summary_path = os.path.join(
+        args.out_dir, f"negative_set_experiment_sclip{suffix}_summary.csv")
 
     exclude_sources = tuple(x.strip() for x in args.exclude_sources.split(",") if x.strip())
     run(args.alpha, args.weighted, out_path, args.benchmark_dir, exclude_sources=exclude_sources,
+        category_shard=shard,
+        also_seen_from=tuple(x.strip() for x in args.also_seen_from.split(",") if x.strip()),
         limit_categories=args.limit_categories, limit_images=limit_images, sample_seed=args.sample_seed, device=args.device)
 
     bd.summarize_csv(out_path, ["approach", "variant"], "fpr", summary_path)
