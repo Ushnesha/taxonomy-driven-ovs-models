@@ -29,6 +29,14 @@
 
 set -euo pipefail
 
+# $HOME is not always set inside `srun --pty bash` on SOL, and every path below
+# depends on it -- unguarded, BENCHMARK_DIR becomes "/workspace/OVS/benchmark" and the
+# run dies with FileNotFoundError on word_sets_v2.json. Recover it from passwd.
+if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ]; then
+    HOME=$(getent passwd "$(id -un)" | cut -d: -f6); export HOME
+    echo "HOME was unset -- recovered as $HOME"
+fi
+
 SET=${1:?usage: sbatch benchmark_catseg.sbatch <positive|negative> [out_dir] [limit_images]}
 ALPHA=${ALPHA:-0.80}        # CAT-Seg's OWN sweep value (not CLIPSeg's 0.69):
                             #   coarse grid peak alpha=0.80  mean_iou 0.336930  (n=20917)
@@ -40,7 +48,9 @@ ALPHA=${ALPHA:-0.80}        # CAT-Seg's OWN sweep value (not CLIPSeg's 0.69):
 REPO=$HOME/workspace/OVS/taxonomy-driven-ovs-models
 EXPDIR=$REPO/model_experiments/catseg
 PY=$EXPDIR/catseg_venv/bin/python
-OUT=${2:-$HOME/workspace/OVS/results/${SET}_catseg_$(date +%Y%m%d_%H%M%S)}
+DRY_TAG=""
+[ -n "${LIMIT_CATEGORIES:-}" ] && DRY_TAG="_DRYRUN"
+OUT=${2:-$HOME/workspace/OVS/results/${SET}_catseg${DRY_TAG}_$(date +%Y%m%d_%H%M%S)}
 LIMIT_IMAGES=${3:-}
 
 # Override from the command line without editing this file, e.g.
@@ -71,6 +81,8 @@ echo "OUT    = $OUT"
 echo "  (pass this OUT as arg 2 to resume, with the SAME arg3)"
 echo "=================================================="
 
+[ -d "$BENCHMARK_DIR" ] || { echo "ABORT: BENCHMARK_DIR does not exist: $BENCHMARK_DIR"; \
+                            echo "  (a leading /workspace instead of $HOME/workspace means HOME was unset)"; exit 1; }
 for f in word_sets_v2.json positive_set_v2.json negative_set_v2.json img_metadata.pkl; do
     [ -f "$BENCHMARK_DIR/$f" ] || { echo "ABORT: missing $BENCHMARK_DIR/$f"; exit 1; }
 done
@@ -100,6 +112,11 @@ fi
 
 ARGS=(--alpha "$ALPHA" --weighted --config "$CONFIG" --weights "$WEIGHTS" --out-dir "$OUT")
 [ -n "$LIMIT_IMAGES" ] && ARGS+=(--limit-images "$LIMIT_IMAGES")
+# LIMIT_CATEGORIES makes a DRY RUN queueable instead of needing an interactive GPU:
+#   LIMIT_CATEGORIES=40 sbatch benchmark_catseg.sbatch positive "" 2
+# Use 40, not 20: sorted() puts uppercase first, so a low cap gives mostly
+# proper-noun artifacts (Frisbee, New Jersey) and no hypo rows at all.
+[ -n "${LIMIT_CATEGORIES:-}" ] && ARGS+=(--limit-categories "$LIMIT_CATEGORIES")
 
 $PY "${SET}_set_experiment.py" "${ARGS[@]}"
 

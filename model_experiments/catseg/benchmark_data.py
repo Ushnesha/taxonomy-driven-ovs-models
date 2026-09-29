@@ -327,16 +327,31 @@ def build_catseg_class_json(bm, out_path):
 # every orchestration script.
 # =============================================================================
 
-def resumable_csv_writer(path, fieldnames, key_fields):
+def resumable_csv_writer(path, fieldnames, key_fields, also_seen_from=()):
     """Opens `path` for append, returns (file, DictWriter, seen) where `seen`
     is the set of key_fields tuples already written -- callers skip any row
     whose key is already in `seen`, so an interrupted run resumes instead of
-    recomputing/duplicating rows."""
+    recomputing/duplicating rows.
+
+    `also_seen_from` is extra CSV paths to seed `seen` from WITHOUT writing to them.
+    That is what makes a sharded job array able to inherit an earlier sequential run:
+    point every shard at the original detail CSV and none of them recomputes the
+    categories it already finished. Two processes must never share one output `path`
+    (their appends interleave and corrupt the file), hence separate files plus this.
+    """
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     exists = os.path.exists(path)
     seen = set()
+    for extra in also_seen_from:
+        if extra and os.path.exists(extra) and os.path.abspath(extra) != os.path.abspath(path):
+            with open(extra) as f:
+                for row in csv.DictReader(f):
+                    try:
+                        seen.add(tuple(row[k] for k in key_fields))
+                    except KeyError:
+                        pass
     if exists:
         with open(path) as f:
             for row in csv.DictReader(f):

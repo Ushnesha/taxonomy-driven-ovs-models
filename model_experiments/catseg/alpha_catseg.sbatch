@@ -34,6 +34,14 @@
 
 set -euo pipefail
 
+# $HOME is not always set inside `srun --pty bash` on SOL, and every path below
+# depends on it -- unguarded, BENCHMARK_DIR becomes "/workspace/OVS/benchmark" and the
+# run dies with FileNotFoundError on word_sets_v2.json. Recover it from passwd.
+if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ]; then
+    HOME=$(getent passwd "$(id -un)" | cut -d: -f6); export HOME
+    echo "HOME was unset -- recovered as $HOME"
+fi
+
 GRID=${1:-coarse}
 REPO=$HOME/workspace/OVS/taxonomy-driven-ovs-models
 EXPDIR=$REPO/model_experiments/catseg

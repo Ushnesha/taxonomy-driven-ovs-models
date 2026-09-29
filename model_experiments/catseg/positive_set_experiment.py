@@ -69,6 +69,7 @@ def predict_masks_for_tags(model, cat_name, image, tag_to_embedding, threshold=N
 
 def run(alpha, weighted, out_path, benchmark_dir, config=None, weights=None, catseg_path=None,
         exclude_sources=(), sample_seed=SAMPLE_SEED,
+        category_shard=None, also_seen_from=(),
         limit_categories=None, limit_images=None, device=None):
     bm = bd.load_benchmark(benchmark_dir, exclude_sources=exclude_sources)
 
@@ -84,9 +85,19 @@ def run(alpha, weighted, out_path, benchmark_dir, config=None, weights=None, cat
     categories = bm.categories
     if limit_categories:
         categories = categories[:limit_categories]
+    if category_shard:
+        i, n = category_shard
+        # Every n-th category, offset i. Interleaved rather than
+        # contiguous so each shard gets a similar mix of easy/hard
+        # and large/small categories -- contiguous blocks would make
+        # one shard finish hours before another.
+        categories = categories[i::n]
+        print(f"shard {i}/{n}: {len(categories)} categories")
     print(f"{len(categories)} eligible categories, approaches={ap.ALL_APPROACHES}")
 
-    f, writer, seen = bd.resumable_csv_writer(out_path, FIELDNAMES, ["category", "img_id"])
+    f, writer, seen = bd.resumable_csv_writer(
+        out_path, FIELDNAMES, ["category", "img_id"],
+        also_seen_from=also_seen_from)
     try:
         for cat_name in categories:
             variants = bd.get_variants(cat_name, bm.word_sets)
@@ -177,6 +188,16 @@ if __name__ == "__main__":
     parser.add_argument("--sample-seed", type=int, default=SAMPLE_SEED,
                          help="seed for the --limit-images random sample; keep at 42 to draw "
                               "the same images as the other models' runs")
+    parser.add_argument("--category-shard", default=None,
+                         help="'I/N' -- process only every N-th category starting at I, for a "
+                              "SLURM job array. Each shard writes its own detail CSV "
+                              "(..._shardIofN.csv); merge them afterwards with merge_shards.py. "
+                              "CAT-Seg cannot batch (one forward pass per variant x approach), "
+                              "so sharding is the only way to use more than one GPU.")
+    parser.add_argument("--also-seen-from", default="",
+                         help="comma-separated existing detail CSVs to treat as already-done "
+                              "WITHOUT writing to them. Point shards at a previous sequential "
+                              "run's CSV so its finished categories are not recomputed.")
     parser.add_argument("--out-dir", default=RESULTS_DIR)
     parser.add_argument("--allow-baseline", action="store_true",
                          help="Allow CLIPSeg-fallback baseline mode even without --limit-categories/"
@@ -199,13 +220,30 @@ if __name__ == "__main__":
 
     THRESHOLD = args.threshold
 
-    out_path = os.path.join(args.out_dir, "positive_set_experiment_catseg.csv")
-    summary_path = os.path.join(args.out_dir, "positive_set_experiment_catseg_summary.csv")
+    shard = None
+    if args.category_shard:
+        try:
+            i_s, n_s = args.category_shard.split("/")
+            shard = (int(i_s), int(n_s))
+        except ValueError:
+            parser.error("--category-shard must look like '3/8'")
+        if not (0 <= shard[0] < shard[1]):
+            parser.error(f"--category-shard out of range: {args.category_shard}")
+    # A distinct file per shard: two processes appending to one CSV interleave rows.
+    suffix = f"_shard{shard[0]}of{shard[1]}" if shard else ""
+    out_path = os.path.join(args.out_dir, f"positive_set_experiment_catseg{suffix}.csv")
+    # Shard suffix here too: without it every array task would race to overwrite
+    # one summary file with its own partial view. The real summary comes from
+    # merge_shards.py once all shards are done.
+    summary_path = os.path.join(
+        args.out_dir, f"positive_set_experiment_catseg{suffix}_summary.csv")
 
     exclude_sources = tuple(x.strip() for x in args.exclude_sources.split(",") if x.strip())
     run(args.alpha, args.weighted, out_path, args.benchmark_dir,
         config=args.config, weights=args.weights, catseg_path=args.catseg_path,
         exclude_sources=exclude_sources, sample_seed=args.sample_seed,
+        category_shard=shard,
+        also_seen_from=tuple(x.strip() for x in args.also_seen_from.split(",") if x.strip()),
         limit_categories=args.limit_categories, limit_images=args.limit_images, device=args.device)
 
     bd.summarize_csv(out_path, ["approach", "variant"], "iou", summary_path)
